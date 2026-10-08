@@ -14,8 +14,13 @@ pub const T: Duration = Duration::from_secs(15);
 /// Starts a listener that echoes every stream (mirror bytes until EOF, then
 /// finish the write half) and echoes datagrams — both transports, one port.
 pub async fn start_echo_server() -> (Arc<kps::Listener>, String) {
+    start_echo_server_on("127.0.0.1:0").await
+}
+
+/// [`start_echo_server`] bound to `bind`, dialed on 127.0.0.1.
+pub async fn start_echo_server_on(bind: &str) -> (Arc<kps::Listener>, String) {
     let listener = kps::listen(
-        "127.0.0.1:0",
+        bind,
         ListenOptions { identity: Some(Identity::generate().unwrap()), ..Default::default() },
     )
     .await

@@ -5,7 +5,7 @@
 //! (which demultiplexes its own connections by connection ID).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -325,6 +325,12 @@ fn extract_ufrag(pkt: &[u8]) -> Option<String> {
     Some(s.split(':').next()?.to_string())
 }
 
+/// The one address per family the server gathers its candidate on (see
+/// `spawn_pc`): 127.0.0.1 or ::1.
+fn is_canonical_loopback(ip: IpAddr) -> bool {
+    ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
+}
+
 /// Spawns the server-side ICE-lite PeerConnection for one client ufrag,
 /// reading from its own inbox and writing via the shared socket. Ported from
 /// libs/go/listener.go spawnPC, with the webrtc-rs-specific single-candidate
@@ -371,7 +377,11 @@ async fn spawn_pc(
     // cosmetic (ICE-lite; the answer SDP is never transmitted), so pin
     // gathering to the loopback interface → exactly one candidate per family →
     // one recv loop. Loopback is excluded by default, so include it explicitly.
+    // A loopback interface can carry more than one address per family (macOS
+    // lo0 has fe80::1 beside ::1, and 127.x aliases are common), which brings
+    // the race back, so keep only the canonical loopback address.
     se.set_interface_filter(Box::new(|name: &str| name.starts_with("lo")));
+    se.set_ip_filter(Box::new(is_canonical_loopback));
     se.set_include_loopback_candidate(true);
 
     let api = APIBuilder::new().with_setting_engine(se).build();
@@ -639,5 +649,19 @@ struct WritePoller {
 impl quinn::UdpPoller for WritePoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
         self.io.poll_send_ready(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gathers_only_the_canonical_loopback_address_of_each_family() {
+        assert!(is_canonical_loopback("127.0.0.1".parse().unwrap()));
+        assert!(is_canonical_loopback("::1".parse().unwrap()));
+        assert!(!is_canonical_loopback("127.72.220.180".parse().unwrap()));
+        assert!(!is_canonical_loopback("fe80::1".parse().unwrap()));
+        assert!(!is_canonical_loopback("192.168.1.10".parse().unwrap()));
     }
 }
