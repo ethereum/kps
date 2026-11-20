@@ -2662,7 +2662,7 @@ dependencies = [
 [[package]]
 name = "webrtc-sctp"
 version = "0.13.0"
-source = "git+https://github.com/ethereum/kps.git?rev=a73a0a8f9e4f76f3b89ba1155562ec836bcf3f3b#a73a0a8f9e4f76f3b89ba1155562ec836bcf3f3b"
+source = "git+https://github.com/ethereum/kps.git?rev=147bb2b4c79bbcde9c6602d08b54a7736f36286a#147bb2b4c79bbcde9c6602d08b54a7736f36286a"
 dependencies = [
  "arc-swap",
  "async-trait",
