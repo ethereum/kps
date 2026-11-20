@@ -8,7 +8,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{datagram_round_trip, echo_round_trip, start_echo_server, T};
+use common::{datagram_round_trip, echo_round_trip, start_echo_server, start_echo_server_on, T};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
@@ -21,6 +21,20 @@ async fn webrtc_echo() {
     let conn = timeout(T, kps::dial_webrtc(&addr)).await.unwrap().unwrap();
     let echoed = echo_round_trip(conn.as_ref(), b"hello kps over webrtc").await;
     assert_eq!(echoed, b"hello kps over webrtc");
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn webrtc_echo_wildcard_listener_on_loopback() {
+    // A gateway binds every interface and a browser on the same machine dials
+    // it on loopback. The server must still gather exactly one candidate per
+    // family when the loopback interface carries extra addresses (macOS lo0
+    // has fe80::1 beside ::1, and 127.x aliases are common), or its ICE agent
+    // never converges.
+    let (_l, addr) = start_echo_server_on("0.0.0.0:0").await;
+    let conn = timeout(T, kps::dial_webrtc(&addr)).await.unwrap().unwrap();
+    let echoed = echo_round_trip(conn.as_ref(), b"hello from the same machine").await;
+    assert_eq!(echoed, b"hello from the same machine");
     conn.close().await.unwrap();
 }
 
