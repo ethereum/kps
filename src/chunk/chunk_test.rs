@@ -214,6 +214,10 @@ fn test_chunk_forward_tsn_unmarshal_failure() -> Result<()> {
             Bytes::from_static(&[0xc0, 0x0, 0x0, 0x4]),
         ),
         (
+            "length shorter than New Cumulative TSN",
+            Bytes::from_static(&[0xc0, 0x0, 0x0, 0x6, 0x0, 0x0, 0x0, 0x0]),
+        ),
+        (
             "missing stream sequence",
             Bytes::from_static(&[
                 0xc0, 0x0, 0x0, 0xe, 0x0, 0x0, 0x0, 0x3, 0x0, 0x4, 0x0, 0x5, 0x0, 0x6,
@@ -740,6 +744,33 @@ fn test_select_ack_chunk_followed_by_a_payload_data_chunk() -> Result<()> {
             .downcast_ref::<ChunkSelectiveAck>()
             .is_some(),
         "Failed to cast Chunk -> SelectiveAck"
+    );
+    assert!(
+        pkt.chunks[1]
+            .as_any()
+            .downcast_ref::<ChunkPayloadData>()
+            .is_some(),
+        "Failed to cast Chunk -> PayloadData"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_forward_tsn_chunk_followed_by_a_payload_data_chunk() -> Result<()> {
+    let raw_pkt = Bytes::from_static(&[
+        0x13, 0x88, 0x13, 0x88, 0x00, 0x00, 0x00, 0x01, 0x19, 0x1e, 0x32,
+        0x27, // A FORWARD-TSN chunk follows.
+        0xc0, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x03, // A payload data chunk follows.
+        0x00, 0x07, 0x00, 0x14, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x35, 0x01, 0x02, 0x03, 0x04,
+    ]);
+    let pkt = Packet::unmarshal(&raw_pkt)?;
+    assert!(
+        pkt.chunks[0]
+            .as_any()
+            .downcast_ref::<ChunkForwardTsn>()
+            .is_some(),
+        "Failed to cast Chunk -> ForwardTsn"
     );
     assert!(
         pkt.chunks[1]
