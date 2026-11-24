@@ -206,8 +206,22 @@ impl RTCDataChannel {
         *self.inner.on_low.lock().unwrap() = Some(f);
     }
 
+    /// Runs `f` once the channel opens, or now if it already has. A caller
+    /// can only register after `create_data_channel` returns, by which time
+    /// the driver may already have processed the peer's open: checking the
+    /// state first and registering after left a window where the open went
+    /// unnoticed and the stream never opened (about 1 in 25,000 opens on
+    /// loopback).
     pub(crate) fn on_open(&self, f: OnOpenFn) {
+        // Store, then check. The driver sets Open, then takes the handler
+        // (channel_open), so whichever side looks second sees the other's
+        // step, and exactly one of them takes the handler.
         *self.inner.on_open.lock().unwrap() = Some(f);
+        if self.ready_state() == RTCDataChannelState::Open {
+            if let Some(f) = self.inner.on_open.lock().unwrap().take() {
+                tokio::spawn(f());
+            }
+        }
     }
 
     pub(crate) fn on_message(&self, f: OnMessageFn) {
@@ -563,6 +577,8 @@ impl Driver {
 
     async fn channel_open(&mut self, id: RTCDataChannelId) {
         if let Some(ch) = self.channels.get(&id) {
+            // State first, then the handler: RTCDataChannel::on_open relies
+            // on this order.
             ch.inner.set_state(RTCDataChannelState::Open);
             let f = ch.inner.on_open.lock().unwrap().take();
             if let Some(f) = f {
