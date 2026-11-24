@@ -724,14 +724,13 @@ impl<'a>
                             );
                             let mut stream = conn.stream(message.stream_id)?;
                             stream.close(now)?;
-
-                            self.ctx.event_outs.push_back(TaggedRTCEventInternal {
-                                now,
-                                event: RTCEventInternal::SCTPStreamClosed(
-                                    message.association_handle,
-                                    message.stream_id,
-                                ),
-                            });
+                            // KPS PATCH: don't announce SCTPStreamClosed here. Closing
+                            // only resets our outgoing stream; the stream id stays in use
+                            // until the peer resets its side, when the association
+                            // unregisters the stream and reports it (AssociationLost →
+                            // SCTPStreamClosed). Announcing it now freed the id in the
+                            // data-channel registry at once: the next channel reused it,
+                            // and the peer's later reset then closed that new channel.
                         }
                         Message::DataChannelThreshold(data_channel_threshold) => {
                             is_dcep_internal_control_message = true;
