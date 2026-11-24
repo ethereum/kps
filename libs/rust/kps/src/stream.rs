@@ -22,9 +22,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::PollSender;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::data_channel_state::RTCDataChannelState;
-use webrtc::data_channel::RTCDataChannel;
+use crate::rtc_driver::{DataChannelMessage, RTCDataChannel, RTCDataChannelState};
 
 use crate::api::Stream;
 use crate::error::{Error, ErrorCode, Result, StreamError};
@@ -433,11 +431,25 @@ async fn writer_task(
             }
         }
     };
-    // A successfully-sent FIN/RESET makes the local write half terminal ON THE
-    // WIRE — the condition §6.5 retirement needs.
-    let mark_terminal_sent = |kind: Option<u8>| {
-        if kind == Some(FrameType::Fin as u8) || kind == Some(FrameType::Reset as u8) {
+    // A FIN/RESET handed to the transport makes the local write half terminal
+    // ON THE WIRE, the condition §6.5 retirement needs. It's marked in two
+    // steps around the send:
+    // - before: set the flag. `send` only queues (rule 4 in rtc_driver.rs),
+    //   so the peer can see the frame and close the channel before `send`
+    //   returns, and that close must not be policed as "closed mid-stream".
+    //   If the send fails, the stream is dead anyway.
+    // - after: check for retirement. Retiring closes the channel once nothing
+    //   is buffered; checked before the frame is queued, that close could
+    //   overtake the FIN itself.
+    let is_terminal =
+        |kind: Option<u8>| kind == Some(FrameType::Fin as u8) || kind == Some(FrameType::Reset as u8);
+    let mark_terminal = |kind: Option<u8>| {
+        if is_terminal(kind) {
             shared.state.lock().unwrap().local_terminal_sent = true;
+        }
+    };
+    let retire_if_terminal = |kind: Option<u8>| {
+        if is_terminal(kind) {
             shared.maybe_retire();
         }
     };
@@ -447,10 +459,11 @@ async fn writer_task(
             life = life_rx.recv() => {
                 let Some(frame) = life else { break };
                 let kind = frame.first().copied();
+                mark_terminal(kind);
                 if !send(frame).await {
                     break;
                 }
-                mark_terminal_sent(kind);
+                retire_if_terminal(kind);
             }
             data = data_rx.recv() => {
                 let Some((frame, reserved)) = data else { break };
@@ -474,11 +487,12 @@ async fn writer_task(
                     }
                     let _ = tokio::time::timeout(Duration::from_millis(100), notified).await;
                 }
+                mark_terminal(kind);
                 if send(frame).await {
                     if reserved > 0 {
                         shared.flow.commit(shared.id, reserved);
                     }
-                    mark_terminal_sent(kind);
+                    retire_if_terminal(kind);
                 } else {
                     if reserved > 0 {
                         shared.flow.release(shared.id, reserved);

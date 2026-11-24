@@ -11,11 +11,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::data_channel_state::RTCDataChannelState;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::peer_connection::RTCPeerConnection;
+use crate::rtc_driver::{
+    DataChannelMessage, RTCDataChannel, RTCDataChannelInit, RTCDataChannelState, RTCPeerConnection,
+};
 
 use crate::api::{Conn, Stream};
 use crate::error::{DatagramTooLargeError, Error, ErrorCode, Result, StreamError};
@@ -464,7 +462,7 @@ impl WebrtcConn {
         // If the PeerConnection/SCTP association itself failed, every channel
         // dies at once — that is the connection-level network-error path
         // (SPEC §8), not a peer protocol violation.
-        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as PCState;
+        use crate::rtc_driver::RTCPeerConnectionState as PCState;
         match self.pc.connection_state() {
             PCState::Failed | PCState::Closed | PCState::Disconnected => {
                 self.tearing_down.store(true, Ordering::SeqCst);

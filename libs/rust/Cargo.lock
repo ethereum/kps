@@ -1260,6 +1260,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha2",
+ "socket2 0.6.4",
  "stun",
  "thiserror 2.0.18",
  "time",

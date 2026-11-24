@@ -17,9 +17,8 @@ mod framing;
 mod ice;
 mod listener;
 mod quic;
-// Wired into the WebRTC transport by the next commit.
-#[allow(dead_code)]
 mod rtc_driver;
+mod rtc_transport;
 mod stream;
 mod webrtc_client;
 
