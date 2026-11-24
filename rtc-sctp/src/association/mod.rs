@@ -2070,9 +2070,15 @@ impl Association {
             .iter()
             .copied()
             .filter(|id| {
-                self.streams
-                    .get(id)
-                    .is_some_and(|s| s.reassembly_queue.is_readable())
+                // KPS PATCH: only a stream the application can still read
+                // (`Stream::read_sctp` refuses any other state) can be
+                // drained. Data left on a stream closed locally is
+                // undeliverable; counting it deferred the peer's reset
+                // forever ("application has not drained").
+                self.streams.get(id).is_some_and(|s| {
+                    s.reassembly_queue.is_readable()
+                        && matches!(s.state, RecvSendState::ReadWritable | RecvSendState::Readable)
+                })
             })
             .collect()
     }
