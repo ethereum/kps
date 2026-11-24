@@ -207,14 +207,36 @@ impl<'a> SctpHandler<'a> {
             return Ok(());
         }
 
-        let mut stream = conn.stream(id)?;
+        // KPS PATCH: a stream that can no longer be read (unregistered, or
+        // closed locally while the peer still had data in flight) is
+        // skipped, not an error. `?` here used to abort the caller's whole
+        // event loop, dropping the edge-triggered `Readable` events of every
+        // other stream in the same batch: those streams then stalled with
+        // data in their reassembly queues and nothing to re-trigger a read.
+        let mut stream = match conn.stream(id) {
+            Ok(s) => s,
+            Err(Error::ErrStreamNotExisted) => {
+                ctx_pending.remove(&(ch, id));
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         loop {
             if *budget == 0 {
                 // Leave the rest in the reassembly queue: that is what shrinks `a_rwnd`.
                 ctx_pending.insert((ch, id));
                 return Ok(());
             }
-            let Some(chunks) = stream.read_sctp()? else {
+            let chunks = match stream.read_sctp() {
+                Ok(c) => c,
+                Err(Error::ErrStreamClosed) => {
+                    debug!("stream {id} closed with data unread; dropping it");
+                    ctx_pending.remove(&(ch, id));
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            let Some(chunks) = chunks else {
                 ctx_pending.remove(&(ch, id));
                 return Ok(());
             };
@@ -724,14 +746,13 @@ impl<'a>
                             );
                             let mut stream = conn.stream(message.stream_id)?;
                             stream.close(now)?;
-
-                            self.ctx.event_outs.push_back(TaggedRTCEventInternal {
-                                now,
-                                event: RTCEventInternal::SCTPStreamClosed(
-                                    message.association_handle,
-                                    message.stream_id,
-                                ),
-                            });
+                            // KPS PATCH: don't announce SCTPStreamClosed here. Closing
+                            // only resets our outgoing stream; the stream id stays in use
+                            // until the peer resets its side, when the association
+                            // unregisters the stream and reports it (AssociationLost →
+                            // SCTPStreamClosed). Announcing it now freed the id in the
+                            // data-channel registry at once: the next channel reused it,
+                            // and the peer's later reset then closed that new channel.
                         }
                         Message::DataChannelThreshold(data_channel_threshold) => {
                             is_dcep_internal_control_message = true;

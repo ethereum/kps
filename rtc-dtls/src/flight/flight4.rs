@@ -8,7 +8,6 @@ use crate::content::*;
 use crate::crypto::*;
 use crate::curve::named_curve::*;
 use crate::curve::*;
-use crate::extension::extension_supported_elliptic_curves::*;
 use crate::extension::extension_supported_point_formats::*;
 use crate::extension::extension_use_extended_master_secret::*;
 use crate::extension::extension_use_srtp::*;
@@ -527,34 +526,7 @@ impl Flight for Flight4 {
         _cache: &HandshakeCache,
         cfg: &HandshakeConfig,
     ) -> Result<Vec<Packet>, (Option<Alert>, Option<Error>)> {
-        let mut extensions = vec![Extension::RenegotiationInfo(ExtensionRenegotiationInfo {
-            renegotiated_connection: 0,
-        })];
-        if (cfg.extended_master_secret == ExtendedMasterSecretType::Request
-            || cfg.extended_master_secret == ExtendedMasterSecretType::Require)
-            && state.extended_master_secret
-        {
-            extensions.push(Extension::UseExtendedMasterSecret(
-                ExtensionUseExtendedMasterSecret { supported: true },
-            ));
-        }
-
-        if state.srtp_protection_profile != SrtpProtectionProfile::Unsupported {
-            extensions.push(Extension::UseSrtp(ExtensionUseSrtp {
-                protection_profiles: vec![state.srtp_protection_profile],
-            }));
-        }
-
-        if !state.is_cipher_suite_psk() {
-            extensions.extend_from_slice(&[
-                Extension::SupportedEllipticCurves(ExtensionSupportedEllipticCurves {
-                    elliptic_curves: cfg.local_named_curves.clone(),
-                }),
-                Extension::SupportedPointFormats(ExtensionSupportedPointFormats {
-                    point_formats: vec![ELLIPTIC_CURVE_POINT_FORMAT_UNCOMPRESSED],
-                }),
-            ]);
-        }
+        let extensions = server_hello_extensions(state, cfg);
 
         let mut pkts = vec![Packet {
             record: RecordLayer::new(
@@ -750,6 +722,44 @@ impl Flight for Flight4 {
     }
 }
 
+/// The extensions of the DTLS 1.2 ServerHello.
+///
+/// `supported_groups` (elliptic_curves, extension 10) is not among them: it is
+/// a ClientHello-only extension, and a TLS 1.2 server sends `ec_point_formats`
+/// alone (RFC 8422 §5.2, RFC 4492 §5.2). pion/dtls v4 (pion/webrtc v5)
+/// validates extensions per handshake message and rejects a ServerHello that
+/// carries it with an `illegal_parameter` alert, so no pion v5 client could
+/// complete a handshake with this server.
+fn server_hello_extensions(state: &State, cfg: &HandshakeConfig) -> Vec<Extension> {
+    let mut extensions = vec![Extension::RenegotiationInfo(ExtensionRenegotiationInfo {
+        renegotiated_connection: 0,
+    })];
+    if (cfg.extended_master_secret == ExtendedMasterSecretType::Request
+        || cfg.extended_master_secret == ExtendedMasterSecretType::Require)
+        && state.extended_master_secret
+    {
+        extensions.push(Extension::UseExtendedMasterSecret(
+            ExtensionUseExtendedMasterSecret { supported: true },
+        ));
+    }
+
+    if state.srtp_protection_profile != SrtpProtectionProfile::Unsupported {
+        extensions.push(Extension::UseSrtp(ExtensionUseSrtp {
+            protection_profiles: vec![state.srtp_protection_profile],
+        }));
+    }
+
+    if !state.is_cipher_suite_psk() {
+        extensions.push(Extension::SupportedPointFormats(
+            ExtensionSupportedPointFormats {
+                point_formats: vec![ELLIPTIC_CURVE_POINT_FORMAT_UNCOMPRESSED],
+            },
+        ));
+    }
+
+    extensions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,5 +877,25 @@ mod tests {
         let f = Flight4 {};
         let res = f.parse(&mut state, &cache, &cfg);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_server_hello_extensions_omit_supported_groups() {
+        let provider =
+            crypto::default_provider().expect("a built-in crypto provider is enabled for tests");
+        let state = State::new(provider.clone(), false);
+        let cfg = HandshakeConfig::new(provider);
+        let extensions = server_hello_extensions(&state, &cfg);
+        assert!(
+            !extensions
+                .iter()
+                .any(|e| matches!(e, Extension::SupportedEllipticCurves(_))),
+            "a DTLS 1.2 ServerHello must not carry supported_groups (extension 10)"
+        );
+        assert!(
+            extensions
+                .iter()
+                .any(|e| matches!(e, Extension::SupportedPointFormats(_)))
+        );
     }
 }
