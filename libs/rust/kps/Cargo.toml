@@ -34,5 +34,9 @@ rustls-pki-types = "1"
 webrtc = { version = "0.14", features = ["pem"] }
 stun = "0.9"
 
+# The sans-I/O webrtc-rs core, patched from branch vendor/rtc ([patch.crates-io]
+# in ../Cargo.toml).
+rtc = "0.21.1"
+
 [dev-dependencies]
 anyhow = { workspace = true }

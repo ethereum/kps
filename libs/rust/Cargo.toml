@@ -37,3 +37,11 @@ anyhow = "1"
 [patch.crates-io]
 webrtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "147bb2b4c79bbcde9c6602d08b54a7736f36286a" }
 webrtc = { git = "https://github.com/ethereum/kps.git", rev = "4982e1c1cdce3baa3f703a746367a5e53ca64928" }
+# - rtc, rtc-sctp, rtc-dtls, rtc-datachannel: the sans-I/O webrtc-rs core the
+#   WebRTC transport runs on, from branch `vendor/rtc` (rtc master plus KPS
+#   PATCH commits and one upstream cherry-pick; see that branch's log). They
+#   share one rev because they come from one workspace.
+rtc = { git = "https://github.com/ethereum/kps.git", rev = "9eedaa4045d17c74ccf5d89044c60926581c0173" }
+rtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "9eedaa4045d17c74ccf5d89044c60926581c0173" }
+rtc-dtls = { git = "https://github.com/ethereum/kps.git", rev = "9eedaa4045d17c74ccf5d89044c60926581c0173" }
+rtc-datachannel = { git = "https://github.com/ethereum/kps.git", rev = "9eedaa4045d17c74ccf5d89044c60926581c0173" }
