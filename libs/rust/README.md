@@ -49,27 +49,28 @@ Timeouts/cancellation are caller-side: wrap any call in
 
 ## Using kps in your project
 
-The crate is **not published to crates.io** (it depends on two vendored
-webrtc-rs forks — see below). Depend on it via git:
+The crate is **not published to crates.io** (it depends on a patched fork of
+webrtc-rs's `rtc` crates; see below). Depend on it via git:
 
 ```toml
 [dependencies]
 kps = { git = "https://github.com/ethereum/kps" }
 
-# REQUIRED: kps only builds with the two vendored webrtc-rs forks below.
-# Cargo applies [patch] ONLY from the root workspace manifest — a patch in a
-# dependency does NOT propagate to you — so you MUST copy this block verbatim
-# into YOUR workspace-root Cargo.toml. Without it the build fails to compile
-# (or hits the bugs the patches fix).
+# REQUIRED: kps needs the patched rtc crates below. Cargo applies [patch] ONLY
+# from the root workspace manifest (a patch in a dependency does NOT propagate
+# to you), so copy this block verbatim into YOUR workspace-root Cargo.toml.
+# Without it kps still builds, against unpatched rtc, and hits the bugs the
+# patches fix (stalled and silently dropped streams, rejected pion v5 clients).
 [patch.crates-io]
-webrtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "147bb2b4c79bbcde9c6602d08b54a7736f36286a" }
-webrtc      = { git = "https://github.com/ethereum/kps.git", rev = "4982e1c1cdce3baa3f703a746367a5e53ca64928" }
+rtc             = { git = "https://github.com/ethereum/kps.git", rev = "9eedaa4045d17c74ccf5d89044c60926581c0173" }
+rtc-sctp        = { git = "https://github.com/ethereum/kps.git", rev = "9eedaa4045d17c74ccf5d89044c60926581c0173" }
+rtc-dtls        = { git = "https://github.com/ethereum/kps.git", rev = "9eedaa4045d17c74ccf5d89044c60926581c0173" }
+rtc-datachannel = { git = "https://github.com/ethereum/kps.git", rev = "9eedaa4045d17c74ccf5d89044c60926581c0173" }
 ```
 
-Both `git` lines must point at the **same revs** this repo's
-[`libs/rust/Cargo.toml`](Cargo.toml) pins; bump them together if you update
-`kps`. This friction is temporary — it goes away once the fixes land upstream
-(see below) and the vendored forks can be dropped.
+All four lines must use the **same rev** this repo's
+[`libs/rust/Cargo.toml`](Cargo.toml) pins; bump them together when you update
+`kps`. This goes away once `rtc` releases the fixes (see below).
 
 ## Tests
 
@@ -83,22 +84,22 @@ transports, including both on one port concurrently. The cross-implementation
 matrix (Rust ↔ Go ↔ JS ↔ browser) lives in `libs/js/test/integration/` and
 `tests/interop/`.
 
-## Vendored webrtc-rs patches (required)
+## The patched rtc crates (required)
 
-`kps` swaps two crates.io dependencies for patched forks via
-`[patch.crates-io]` in [`Cargo.toml`](Cargo.toml). Each fork is an **orphan
-branch of this repo** holding a *verbatim* crates.io copy plus one or two fix
-commits (grep `KPS PATCH` for the exact diff), pinned by rev so builds don't
-float with the branch. Anyone consuming `kps` must replicate the same patch
-block (see [Using kps in your project](#using-kps-in-your-project)) — Cargo
-does not inherit `[patch]` from a dependency.
+The WebRTC transport runs on webrtc-rs's sans-I/O
+[`rtc`](https://github.com/webrtc-rs/rtc) core. `kps` takes four of its crates
+(`rtc`, `rtc-sctp`, `rtc-dtls`, `rtc-datachannel`) from branch `vendor/rtc` of
+this repo via `[patch.crates-io]` in [`Cargo.toml`](Cargo.toml), pinned by rev
+so builds don't float with the branch. The branch is a copy of `rtc` master
+plus these commits (grep `KPS PATCH`):
 
-| Crate | Branch / rev | Fix | Upstream |
-|-------|--------------|-----|----------|
-| `webrtc-sctp` | `vendor/webrtc-sctp` @ `147bb2b` | (1) drain the reassembly queue before honoring `read_shutdown` — a peer that writes then promptly closes a channel otherwise loses data at a webrtc-rs receiver ~10% of the time; (2) accept the in-sequence chunk at a full receive buffer — otherwise a tail-of-burst drop deadlocks the association at a permanent zero window; (3) bound FORWARD-TSN parsing by the chunk's own length — otherwise a FORWARD-TSN bundled ahead of DATA (Chrome's dcsctp does this after abandoned datagrams) drops the whole packet, and one shorter than 8 bytes panics | [#816](https://github.com/webrtc-rs/webrtc/issues/816), [#822](https://github.com/webrtc-rs/webrtc/issues/822); (3) [kps#7](https://github.com/ethereum/kps/pull/7), fixed in `rtc` by [rtc#89](https://github.com/webrtc-rs/rtc/pull/89) |
-| `webrtc` | `vendor/webrtc` @ `4982e1c` | (1) adopt a negotiated data channel's stream in the accept loop — an early inbound message (KPS's HELLO) otherwise gets parsed as DCEP, fails with `InvalidMessageType`, and silently kills the accept loop for the whole connection; (2) gate the id-reuse claim on `ReadyState::Open` — otherwise a stale CLOSED channel (never pruned from `data_channels`) shadows a browser's reused SCTP stream id and the new stream is swallowed (read hangs after ~2 streams) | [#821](https://github.com/webrtc-rs/webrtc/issues/821); (2) is a regression from (1), not upstream ([kps#4](https://github.com/ethereum/kps/issues/4)) |
+| Crate | Fix | Upstream |
+|-------|-----|----------|
+| `rtc-dtls` | the ServerHello no longer carries `supported_groups`, a ClientHello-only extension that made pion v5 clients abort the handshake | not filed yet |
+| `rtc` | a closed data channel's stream id stays reserved until SCTP finishes resetting it; otherwise the peer's late reset closed the new channel that reused the id | [rtc#311](https://github.com/webrtc-rs/rtc/issues/311) |
+| `rtc-sctp` | no duplicate outgoing reset when both ends close a stream at once; the duplicate could reset a stream that reused the id | not filed yet |
+| `rtc` | one unreadable stream no longer aborts the SCTP read batch, which silently dropped other channels' acknowledged messages and stalled their streams | [rtc#340](https://github.com/webrtc-rs/rtc/issues/340) |
+| `rtc-sctp` | a peer's reset is no longer held open forever by data on a stream we already closed | not filed yet |
+| `rtc-sctp`, `rtc-datachannel` | bounds checks for two unmarshal panics a connected peer could trigger (cherry-picked) | [rtc#333](https://github.com/webrtc-rs/rtc/pull/333) |
 
-Each branch is `<verbatim crates.io copy>` then `<KPS PATCH commit(s)>`, so the
-diff against upstream is exactly those commits. Drop the patches (and this
-section) once releases ship equivalent fixes; bump the pinned revs here and in
-any consumer's workspace together if the forks are updated.
+Drop the patches (and this section) once `rtc` releases equivalent fixes.

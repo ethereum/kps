@@ -375,10 +375,6 @@ fn map_for_socket(local: &SocketAddr, target: SocketAddr) -> SocketAddr {
     }
 }
 
-// ---------------------------------------------------------------------------
-// WebRTC side: per-PC packet conn + single-conn mux (Go: pcPacketConn +
-// singleConnMux).
-
 fn kps_debug_listener() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KPS_DEBUG").is_some())
