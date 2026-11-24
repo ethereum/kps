@@ -2098,8 +2098,14 @@ impl Association {
                 if draining.contains(id) {
                     continue;
                 }
-                if self.streams.contains_key(id) {
-                    if respond {
+                if let Some(s) = self.streams.get(id) {
+                    // KPS PATCH: answer with our own outgoing reset only if we
+                    // haven't sent one already. When both ends close a stream at
+                    // once, each has reset its outgoing side (Stream::close leaves
+                    // the state Closed); a second reset would reach the peer after
+                    // it has unregistered the stream and reused its id for a new
+                    // stream, and reset that one.
+                    if respond && s.state != RecvSendState::Closed {
                         sis_to_reset.push(*id);
                     }
                     self.unregister_stream(*id, AssociationError::Reset);
