@@ -193,3 +193,79 @@ async fn single_port_both_transports() {
     quic_task.await.unwrap();
     webrtc_task.await.unwrap();
 }
+
+/// Several streams echo bulk data at once, each written in 64 KiB chunks.
+/// A chunk is four full DATA frames (16 383-byte payloads, SPEC §6.2) plus a
+/// 4-byte one, so small SCTP messages travel interleaved with large
+/// fragmented ones on several streams at once. Every echo must be byte-exact
+/// and must finish: a lost small frame shows up as a short echo, and a lost
+/// FIN or credit frame stalls a stream, which the per-step timeouts turn into
+/// a failure naming the stream and how far it got.
+///
+/// Guards the SCTP read path under concurrency. It stalled 2 runs in 3 on an
+/// early port to the sans-I/O `rtc` stack; set `KPS_BULK_BYTES` to stress it
+/// harder than the CI default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webrtc_concurrent_bulk_streams_byte_exact() {
+    const STREAMS: usize = 4;
+    const CHUNK: usize = 64 << 10;
+    let per_stream: usize = std::env::var("KPS_BULK_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4 << 20);
+    let (_l, addr) = start_echo_server().await;
+    let conn: Arc<dyn Conn> =
+        Arc::from(timeout(T, kps::dial_webrtc(&addr)).await.unwrap().unwrap());
+
+    let mut tasks = Vec::new();
+    for i in 0..STREAMS {
+        let conn = conn.clone();
+        tasks.push(tokio::spawn(async move {
+            // Distinct per stream, so a frame delivered to the wrong stream
+            // can't pass for the right one.
+            let payload: Vec<u8> = (0..per_stream)
+                .map(|j| ((j * 7 + i * 13) % 251) as u8)
+                .collect();
+            let stream = timeout(T, conn.open_stream()).await.unwrap().unwrap();
+            let (mut rd, mut wr) = tokio::io::split(stream);
+
+            let to_send = payload.clone();
+            let writer = tokio::spawn(async move {
+                for chunk in to_send.chunks(CHUNK) {
+                    timeout(T, wr.write_all(chunk))
+                        .await
+                        .expect("write stalled")
+                        .unwrap();
+                }
+                timeout(T, wr.shutdown())
+                    .await
+                    .expect("FIN stalled")
+                    .unwrap();
+            });
+
+            let mut echoed = Vec::with_capacity(per_stream);
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                let n = timeout(T, rd.read(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "stream {i}: read stalled after {} of {per_stream} bytes",
+                            echoed.len()
+                        )
+                    })
+                    .unwrap();
+                if n == 0 {
+                    break;
+                }
+                echoed.extend_from_slice(&buf[..n]);
+            }
+            writer.await.unwrap();
+            assert_eq!(echoed.len(), per_stream, "stream {i}: echo length");
+            assert!(echoed == payload, "stream {i}: echo content differs");
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+}
