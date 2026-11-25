@@ -5,7 +5,7 @@
 //! (which demultiplexes its own connections by connection ID).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -13,23 +13,13 @@ use std::task::{Context, Poll};
 
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
-use webrtc::api::setting_engine::SettingEngine;
-use webrtc::api::APIBuilder;
-use webrtc::ice::network_type::NetworkType;
-use webrtc::ice::udp_mux::UDPMux;
-use webrtc::ice::udp_network::UDPNetwork;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::address::format_address;
 use crate::api::Conn;
 use crate::cert::Identity;
-use crate::conn::WebrtcConn;
 use crate::error::{Error, Result};
-use crate::ice::derive_ice_pwd;
 use crate::quic::{server_config, QuicConn};
+use crate::rtc_driver::RTCPeerConnection;
 
 type Packet = (Vec<u8>, SocketAddr);
 
@@ -71,7 +61,7 @@ struct EntriesInner {
 #[derive(Clone)]
 struct Entry {
     inbox: mpsc::Sender<Packet>,
-    pc: Arc<RTCPeerConnection>,
+    pc: RTCPeerConnection,
 }
 
 impl Entries {
@@ -82,11 +72,24 @@ impl Entries {
         }
     }
 
-    fn close_all(&self) -> Vec<Arc<RTCPeerConnection>> {
+    fn close_all(&self) -> Vec<RTCPeerConnection> {
         let mut inner = self.0.lock().unwrap();
         inner.by_addr.clear();
         inner.by_ufrag.drain().map(|(_, e)| e.pc).collect()
     }
+}
+
+/// Kernel send and receive buffer requested for a WebRTC UDP socket.
+const UDP_SOCKET_BUFFER: usize = 4 << 20;
+
+/// Requests [`UDP_SOCKET_BUFFER`] send and receive buffers on `socket` (rule 6
+/// in rtc_driver.rs). The OS default (~208 KiB on Linux) overflows under a
+/// burst, and SCTP, which doesn't pace, reads the drops as congestion. Best
+/// effort: the kernel caps it at net.core.{r,w}mem_max.
+pub(crate) fn enlarge_udp_buffers(socket: &UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER);
 }
 
 /// Binds a UDP socket and starts accepting kps connections. `addr` is a
@@ -115,6 +118,7 @@ pub async fn listen(addr: &str, opts: ListenOptions) -> Result<Listener> {
             .await
             .map_err(|e| Error::Transport(format!("listen {addr:?}: {e}")))?,
     );
+    enlarge_udp_buffers(&socket);
     let local = socket.local_addr()?;
 
     let (accept_tx, accept_rx) = mpsc::channel::<Box<dyn Conn>>(16);
@@ -254,7 +258,7 @@ async fn pump(
 
         let route = match route {
             Some(tx) => Some(tx),
-            None if stun::message::is_message(&pkt) => {
+            None if rtc::stun::message::is_stun_message(&pkt) => {
                 match extract_ufrag(&pkt) {
                     Some(ufrag) => {
                         let tx = {
@@ -264,15 +268,24 @@ async fn pump(
                         let tx = match tx {
                             Some(tx) => tx,
                             None => {
-                                let (tx, rx) = mpsc::channel::<Packet>(256);
-                                match spawn_pc(
+                                // Rule 6 (rtc_driver.rs): room for more than a
+                                // full SCTP receive window (1 MiB, about 900
+                                // packets). At 256 a bulk transfer lost hundreds
+                                // of packets a run to a full inbox.
+                                let (tx, rx) = mpsc::channel::<Packet>(2048);
+                                let on_gone = {
+                                    let entries = entries.clone();
+                                    let ufrag = ufrag.clone();
+                                    Box::new(move || entries.remove_ufrag(&ufrag))
+                                };
+                                match crate::rtc_transport::spawn_pc(
                                     socket.clone(),
                                     identity.clone(),
                                     ufrag.clone(),
                                     from,
                                     rx,
                                     accept_tx.clone(),
-                                    entries.clone(),
+                                    on_gone,
                                 )
                                 .await
                                 {
@@ -315,9 +328,9 @@ async fn pump(
 }
 
 fn extract_ufrag(pkt: &[u8]) -> Option<String> {
-    let mut m = stun::message::Message::new();
+    let mut m = rtc::stun::message::Message::new();
     m.unmarshal_binary(pkt).ok()?;
-    let (attr, found) = m.attributes.get(stun::attributes::ATTR_USERNAME);
+    let (attr, found) = m.attributes.get(rtc::stun::attributes::ATTR_USERNAME);
     if !found {
         return None;
     }
@@ -325,142 +338,10 @@ fn extract_ufrag(pkt: &[u8]) -> Option<String> {
     Some(s.split(':').next()?.to_string())
 }
 
-/// The one address per family the server gathers its candidate on (see
-/// `spawn_pc`): 127.0.0.1 or ::1.
-fn is_canonical_loopback(ip: IpAddr) -> bool {
-    ip == IpAddr::V4(Ipv4Addr::LOCALHOST) || ip == IpAddr::V6(Ipv6Addr::LOCALHOST)
-}
-
-/// Spawns the server-side ICE-lite PeerConnection for one client ufrag,
-/// reading from its own inbox and writing via the shared socket. Ported from
-/// libs/go/listener.go spawnPC, with the webrtc-rs-specific single-candidate
-/// constraint (see the interface filter below).
-async fn spawn_pc(
-    socket: Arc<UdpSocket>,
-    identity: Arc<Identity>,
-    ufrag: String,
-    client_addr: SocketAddr,
-    inbox: mpsc::Receiver<Packet>,
-    accept_tx: mpsc::Sender<Box<dyn Conn>>,
-    entries: Entries,
-) -> Result<Arc<RTCPeerConnection>> {
-    let local = socket.local_addr()?;
-    let port = local.port();
-    let pwd = derive_ice_pwd(&identity.digest, &ufrag);
-
-    let pc_conn = Arc::new(PcConn {
-        socket: socket.clone(),
-        inbox: tokio::sync::Mutex::new(inbox),
-        local,
-    });
-
-    let mut se = SettingEngine::default();
-    se.set_lite(true);
-    se.set_udp_network(UDPNetwork::Muxed(Arc::new(SingleConnMux { conn: pc_conn })));
-    // Derive the ICE password from the pinned certhash (SPEC §5.2); the client
-    // computes the identical value, so only a certhash-holder passes STUN
-    // integrity. Pin our local creds to (ufrag, derived pwd).
-    se.set_ice_credentials(ufrag.clone(), pwd.clone());
-    se.disable_certificate_fingerprint_verification(true);
-    // Restrict ICE to the client's address family: a candidate pair only forms
-    // when local and remote families match. Writes still go out the one shared
-    // socket regardless.
-    se.set_network_types(vec![if client_addr.is_ipv6() {
-        NetworkType::Udp6
-    } else {
-        NetworkType::Udp4
-    }]);
-    // CRITICAL (webrtc-rs quirk): muxed gathering creates one host candidate
-    // PER interface and every candidate spawns a recv loop racing on the same
-    // muxed conn — inbound STUN gets attributed to a random local candidate and
-    // the controlled agent never converges. The server's local candidates are
-    // cosmetic (ICE-lite; the answer SDP is never transmitted), so pin
-    // gathering to the loopback interface → exactly one candidate per family →
-    // one recv loop. Loopback is excluded by default, so include it explicitly.
-    // A loopback interface can carry more than one address per family (macOS
-    // lo0 has fe80::1 beside ::1, and 127.x aliases are common), which brings
-    // the race back, so keep only the canonical loopback address.
-    se.set_interface_filter(Box::new(|name: &str| name.starts_with("lo")));
-    se.set_ip_filter(Box::new(is_canonical_loopback));
-    se.set_include_loopback_candidate(true);
-
-    let api = APIBuilder::new().with_setting_engine(se).build();
-    let pc = Arc::new(
-        api.new_peer_connection(RTCConfiguration {
-            certificates: vec![identity.rtc_certificate()?],
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| Error::Transport(format!("peer connection: {e}")))?,
-    );
-
-    // WebrtcConn owns on_data_channel (client-opened channels surface as
-    // streams) and creates our side of the negotiated control (ID 0) and
-    // datagram (ID 1) channels (SPEC §8). The remote endpoint is the client's
-    // first STUN source.
-    let conn = WebrtcConn::new(pc.clone(), None, client_addr).await?;
-    let close_state = conn.close_state.clone();
-    let conn_slot = Arc::new(Mutex::new(Some(conn)));
-
-    {
-        let pc2 = pc.clone();
-        let ufrag = ufrag.clone();
-        pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-            let accept_tx = accept_tx.clone();
-            let conn_slot = conn_slot.clone();
-            let close_state = close_state.clone();
-            let entries = entries.clone();
-            let ufrag = ufrag.clone();
-            let _pc = pc2.clone();
-            Box::pin(async move {
-                match s {
-                    RTCPeerConnectionState::Connected => {
-                        // Take the conn out of the slot before awaiting (a
-                        // MutexGuard must not live across an await).
-                        let taken = conn_slot.lock().unwrap().take();
-                        if let Some(conn) = taken {
-                            // Surface only after mutual HELLO (SPEC §8: accept
-                            // MUST NOT complete before it) — bounded by the
-                            // conn's HELLO timeout. A rejected/failed handshake
-                            // tears the conn down without ever surfacing it.
-                            tokio::spawn(async move {
-                                if conn.wait_established().await.is_ok() {
-                                    let _ = accept_tx.send(Box::new(conn) as Box<dyn Conn>).await;
-                                }
-                            });
-                        }
-                    }
-                    RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => {
-                        close_state.mark(None);
-                        entries.remove_ufrag(&ufrag);
-                    }
-                    _ => {}
-                }
-            })
-        }));
-    }
-
-    let offer = RTCSessionDescription::offer(build_client_offer(&ufrag, &pwd, port, client_addr))
-        .map_err(|e| Error::Transport(format!("offer: {e}")))?;
-    pc.set_remote_description(offer)
-        .await
-        .map_err(|e| Error::Transport(format!("set remote: {e}")))?;
-    let answer = pc
-        .create_answer(None)
-        .await
-        .map_err(|e| Error::Transport(format!("answer: {e}")))?;
-    // Never transmitted — KPS has no signaling; the client synthesizes it.
-    pc.set_local_description(answer)
-        .await
-        .map_err(|e| Error::Transport(format!("set local: {e}")))?;
-
-    Ok(pc)
-}
-
 /// Fabricates the SDP offer the browser would have produced (the server never
 /// sees the real one). The DTLS fingerprint is a placeholder because the
 /// server doesn't pin the client's identity.
-fn build_client_offer(ufrag: &str, pwd: &str, port: u16, client_addr: SocketAddr) -> String {
+pub(crate) fn build_client_offer(ufrag: &str, pwd: &str, port: u16, client_addr: SocketAddr) -> String {
     const PLACEHOLDER_FP: &str = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
     let (fam, any_addr) =
         if client_addr.is_ipv6() { ("IP6", "::") } else { ("IP4", "0.0.0.0") };
@@ -494,91 +375,9 @@ fn map_for_socket(local: &SocketAddr, target: SocketAddr) -> SocketAddr {
     }
 }
 
-// ---------------------------------------------------------------------------
-// WebRTC side: per-PC packet conn + single-conn mux (Go: pcPacketConn +
-// singleConnMux).
-
 fn kps_debug_listener() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KPS_DEBUG").is_some())
-}
-
-/// `webrtc::util::Conn` for a single PeerConnection: reads pull from a per-PC
-/// inbox fed by the pump; writes go to the shared real UDP socket.
-struct PcConn {
-    socket: Arc<UdpSocket>,
-    inbox: tokio::sync::Mutex<mpsc::Receiver<Packet>>,
-    local: SocketAddr,
-}
-
-#[async_trait::async_trait]
-impl webrtc::util::Conn for PcConn {
-    async fn connect(&self, _addr: SocketAddr) -> webrtc::util::Result<()> {
-        Err(webrtc::util::Error::Other("connect unsupported".into()))
-    }
-    async fn recv(&self, buf: &mut [u8]) -> webrtc::util::Result<usize> {
-        self.recv_from(buf).await.map(|(n, _)| n)
-    }
-    async fn recv_from(&self, buf: &mut [u8]) -> webrtc::util::Result<(usize, SocketAddr)> {
-        let mut rx = match self.inbox.try_lock() {
-            Ok(rx) => rx,
-            Err(_) => {
-                // A second concurrent reader on this PC's inbox would steal
-                // packets from the live ICE conn (the webrtc-rs mux race).
-                if kps_debug_listener() {
-                    eprintln!("[kps-listener] CONCURRENT inbox readers on {}", self.local);
-                }
-                self.inbox.lock().await
-            }
-        };
-        match rx.recv().await {
-            Some((pkt, from)) => {
-                let n = pkt.len().min(buf.len());
-                buf[..n].copy_from_slice(&pkt[..n]);
-                Ok((n, from))
-            }
-            None => Err(webrtc::util::Error::Other("inbox closed".into())),
-        }
-    }
-    async fn send(&self, _buf: &[u8]) -> webrtc::util::Result<usize> {
-        Err(webrtc::util::Error::Other("send unsupported".into()))
-    }
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> webrtc::util::Result<usize> {
-        let target = map_for_socket(&self.local, target);
-        Ok(self.socket.send_to(buf, target).await?)
-    }
-    fn local_addr(&self) -> webrtc::util::Result<SocketAddr> {
-        Ok(self.local)
-    }
-    fn remote_addr(&self) -> Option<SocketAddr> {
-        None
-    }
-    async fn close(&self) -> webrtc::util::Result<()> {
-        Ok(())
-    }
-    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
-        self
-    }
-}
-
-/// Satisfies the ICE agent's mux interface by always returning this PC's conn
-/// regardless of ufrag — each PC's agent reads from its own inbox.
-struct SingleConnMux {
-    conn: Arc<PcConn>,
-}
-
-#[async_trait::async_trait]
-impl UDPMux for SingleConnMux {
-    async fn close(&self) -> std::result::Result<(), webrtc::util::Error> {
-        Ok(())
-    }
-    async fn get_conn(
-        self: Arc<Self>,
-        _ufrag: &str,
-    ) -> std::result::Result<Arc<dyn webrtc::util::Conn + Send + Sync>, webrtc::util::Error> {
-        Ok(self.conn.clone() as Arc<dyn webrtc::util::Conn + Send + Sync>)
-    }
-    async fn remove_conn_by_ufrag(&self, _ufrag: &str) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -649,19 +448,5 @@ struct WritePoller {
 impl quinn::UdpPoller for WritePoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
         self.io.poll_send_ready(cx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gathers_only_the_canonical_loopback_address_of_each_family() {
-        assert!(is_canonical_loopback("127.0.0.1".parse().unwrap()));
-        assert!(is_canonical_loopback("::1".parse().unwrap()));
-        assert!(!is_canonical_loopback("127.72.220.180".parse().unwrap()));
-        assert!(!is_canonical_loopback("fe80::1".parse().unwrap()));
-        assert!(!is_canonical_loopback("192.168.1.10".parse().unwrap()));
     }
 }

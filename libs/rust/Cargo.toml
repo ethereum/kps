@@ -4,7 +4,7 @@ resolver = "2"
 members = ["kps", "kps-server", "kps-dial"]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/ethereum/kps"
@@ -14,26 +14,14 @@ kps = { path = "kps" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 anyhow = "1"
 
-# webrtc-sctp carries a KPS fix (drain the reassembly queue before honoring
-# read_shutdown) pending upstream: without it, a peer that writes and promptly
-# closes a data channel loses data at a webrtc-rs receiver ~10% of the time.
-# The patched source lives on the orphan branch `vendor/webrtc-sctp` of this
-# repo — verbatim crates.io 0.13.0 plus one commit (grep "KPS PATCH") — pinned
-# by rev so builds don't float with the branch.
-# Upstream: https://github.com/webrtc-rs/webrtc/issues/816
-# Vendored dependency patches, each an orphan branch of this repo holding a
-# verbatim crates.io copy plus fix commit(s) (grep "KPS PATCH"). Upstream
-# issues:
-# - webrtc-sctp: read-shutdown drain (webrtc-rs/webrtc#816) + permanent
-#   zero-window deadlock on tail-of-burst loss (webrtc-rs/webrtc#822) +
-#   FORWARD-TSN parsing bounded by the chunk's own length, so a FORWARD-TSN
-#   bundled ahead of DATA (as Chrome sends it) no longer drops the packet (kps#7).
-# - webrtc: two KPS-patch commits. (1) negotiated-channel accept race — early
-#   inbound message on a negotiated stream parsed as DCEP, killing the accept
-#   loop (webrtc-rs/webrtc#821). (2) a regression from (1), NOT an upstream bug:
-#   the id-reuse claim matched stale CLOSED channels (never pruned from
-#   data_channels), so a browser's reused SCTP stream id was swallowed — read
-#   hangs after ~2 streams (kps#4). Fixed by gating the claim on ReadyState::Open.
+# The WebRTC transport runs on webrtc-rs's sans-I/O rtc core. Four of its
+# crates come from this repo's branch `vendor/rtc`: rtc master plus KPS PATCH
+# commits and one upstream cherry-pick (see that branch's log, or the table in
+# README.md). They share one rev because they come from one workspace, and the
+# rev pins builds so they don't float with the branch. Consumers must copy this
+# block: Cargo applies [patch] only from the root workspace.
 [patch.crates-io]
-webrtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "147bb2b4c79bbcde9c6602d08b54a7736f36286a" }
-webrtc = { git = "https://github.com/ethereum/kps.git", rev = "4982e1c1cdce3baa3f703a746367a5e53ca64928" }
+rtc = { git = "https://github.com/ethereum/kps.git", rev = "935135b09a1b0150d34b59d6df30326e5fa59ed2" }
+rtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "935135b09a1b0150d34b59d6df30326e5fa59ed2" }
+rtc-dtls = { git = "https://github.com/ethereum/kps.git", rev = "935135b09a1b0150d34b59d6df30326e5fa59ed2" }
+rtc-datachannel = { git = "https://github.com/ethereum/kps.git", rev = "935135b09a1b0150d34b59d6df30326e5fa59ed2" }

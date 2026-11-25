@@ -17,6 +17,8 @@ mod framing;
 mod ice;
 mod listener;
 mod quic;
+mod rtc_driver;
+mod rtc_transport;
 mod stream;
 mod webrtc_client;
 
@@ -27,3 +29,11 @@ pub use error::{DatagramTooLargeError, Error, ErrorCode, Result, StreamError};
 pub use listener::{listen, ListenOptions, Listener};
 pub use quic::dial;
 pub use webrtc_client::dial_webrtc;
+
+/// Test support, not API: how many WebRTC channels the driver has had to
+/// close after 30 s of outstanding bytes that never drained. Always 0 unless
+/// there is an accounting bug.
+#[doc(hidden)]
+pub fn rtc_drain_stalls() -> usize {
+    rtc_driver::drain_stalls()
+}

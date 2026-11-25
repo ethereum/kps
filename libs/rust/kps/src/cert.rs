@@ -22,7 +22,7 @@ pub struct Identity {
     pub(crate) cert_der: Vec<u8>,
     /// PKCS#8 DER private key.
     pub(crate) key_der: Vec<u8>,
-    /// PKCS#8 PEM private key (kept for PEM round-trips and webrtc-rs).
+    /// PKCS#8 PEM private key (kept for PEM round-trips).
     key_pem: String,
     /// Multibase 'u' + multihash sha-256 certhash (SPEC §3).
     pub certhash: String,
@@ -112,20 +112,21 @@ impl Identity {
         })
     }
 
-    /// The identity as a webrtc-rs certificate for the DTLS side. Built from
-    /// the stored DER verbatim so the wire fingerprint equals the certhash.
-    pub(crate) fn rtc_certificate(&self) -> Result<webrtc::peer_connection::certificate::RTCCertificate> {
-        let key_pair = rcgen::KeyPair::from_pem(&self.key_pem)
-            .map_err(|e| Error::Identity(format!("key for DTLS: {e}")))?;
-        let private_key = webrtc::dtls::crypto::CryptoPrivateKey::from_key_pair(&key_pair)
-            .map_err(|e| Error::Identity(format!("key for DTLS: {e}")))?;
-        let dtls_cert = webrtc::dtls::crypto::Certificate {
-            certificate: vec![rustls_pki_types::CertificateDer::from(self.cert_der.clone())],
-            private_key,
-        };
+    /// The identity as an `rtc` certificate for the DTLS side. Built from the
+    /// stored DER verbatim so the wire fingerprint equals the certhash.
+    pub(crate) fn rtc_certificate(&self) -> Result<rtc::peer_connection::certificate::RTCCertificate> {
+        let provider = rtc::crypto::default_provider()
+            .map_err(|e| Error::Identity(format!("crypto provider: {e}")))?;
         let expires = std::time::SystemTime::now()
             + std::time::Duration::from_secs(CERT_LIFETIME_DAYS as u64 * 24 * 3600);
-        Ok(webrtc::peer_connection::certificate::RTCCertificate::from_existing(dtls_cert, expires))
+        rtc::peer_connection::certificate::RTCCertificate::from_pkcs8(
+            provider.crypto(),
+            rtc::crypto::SignatureScheme::EcdsaP256Sha256,
+            vec![rustls_pki_types::CertificateDer::from(self.cert_der.clone())],
+            &self.key_der,
+            expires,
+        )
+        .map_err(|e| Error::Identity(format!("DTLS certificate: {e}")))
     }
 
     /// The identity as rustls cert + key for the QUIC side. The same DER as the
@@ -202,12 +203,14 @@ mod tests {
 
     #[test]
     fn dtls_fingerprint_matches_certhash() {
-        // The load-bearing SPEC §3 invariant: webrtc-rs's advertised sha-256
+        // The load-bearing SPEC §3 invariant: the DTLS certificate's sha-256
         // fingerprint is the sha256 of the same DER the certhash covers.
         let id = Identity::generate().unwrap();
         let rtc = id.rtc_certificate().unwrap();
+        let provider = rtc::crypto::default_provider().unwrap();
         let fp = rtc
-            .get_fingerprints()
+            .get_fingerprints(provider.crypto())
+            .unwrap()
             .into_iter()
             .find(|f| f.algorithm == "sha-256")
             .expect("sha-256 fingerprint");

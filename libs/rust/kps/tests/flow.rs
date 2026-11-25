@@ -101,9 +101,10 @@ async fn stream_limit_blocks_and_retires() {
 /// test above exercises only a single reclaim; this exercises sustained
 /// recycling.
 ///
-/// NOTE: webrtc-rs allocates SCTP stream ids monotonically, so this does NOT
-/// exercise stream-id *reuse*. Browsers free and reuse low ids as channels
-/// close, its own hazard (kps#4) — covered only by the Playwright browser leg.
+/// It also exercises stream-id *reuse*: rtc, like browsers, hands out the
+/// lowest free SCTP stream id, so ids recycle as channels close. A stale
+/// close for an old channel landing on its reused id (vendor/rtc's stream-id
+/// patches) shows up here as a hung open.
 #[tokio::test]
 async fn stream_slots_recycle_across_many_streams() {
     let (_l, client, server) = webrtc_pair().await;

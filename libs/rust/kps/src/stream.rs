@@ -22,9 +22,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::PollSender;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::data_channel_state::RTCDataChannelState;
-use webrtc::data_channel::RTCDataChannel;
+use crate::rtc_driver::{DataChannelMessage, RTCDataChannel, RTCDataChannelState};
 
 use crate::api::Stream;
 use crate::error::{Error, ErrorCode, Result, StreamError};
@@ -85,7 +83,14 @@ struct State {
     peer_reset: Option<StreamError>, // peer RESET observed
     peer_stop: Option<StreamError>,  // peer STOP_SENDING observed
     local_terminal: Option<Terminal>,
-    local_terminal_sent: bool, // FIN/RESET actually handed to the transport
+    // The local FIN/RESET, in two steps around handing it to the transport
+    // (see writer_task): `local_terminal_sent` is set just before, so a peer
+    // that closes on seeing it isn't policed as "closed mid-stream";
+    // `local_terminal_queued` is set once it's queued, and only then may we
+    // initiate our own close. The close must never be queued ahead of the
+    // frame: rtc discards writes to a stream it is resetting.
+    local_terminal_sent: bool,
+    local_terminal_queued: bool,
     read_cancel: bool,         // local cancel_read
     drop_data: bool,   // writer task discards queued-but-unsent DATA
     dc_open: bool,
@@ -223,10 +228,11 @@ impl Shared {
     fn maybe_retire(&self) {
         let (wire_complete, drained, dc_closed, fire) = {
             let mut st = self.state.lock().unwrap();
-            // Wire-complete needs the local terminal frame ON THE WIRE (handed
-            // to the transport by the writer task), not merely queued.
+            // Wire-complete needs the local terminal frame handed to the
+            // transport by the writer task (queued behind our earlier frames),
+            // not merely produced.
             let wire_complete =
-                st.local_terminal_sent && (st.peer_fin || st.peer_reset.is_some());
+                st.local_terminal_queued && (st.peer_fin || st.peer_reset.is_some());
             let drained = st.inbuf.is_empty();
             let dc_closed = st.dc_closed;
             let mut fire = false;
@@ -240,14 +246,11 @@ impl Shared {
             return;
         }
         if !dc_closed {
-            // Let the terminal frame flush out of the SCTP send buffer before
-            // resetting the stream (bounded so close stays prompt).
+            // Initiate the close. The driver holds it until everything sent
+            // on the channel is acknowledged (rule 8 in rtc_driver.rs), so the
+            // FIN can't be overtaken by the reset.
             let dc = self.dc.clone();
             tokio::spawn(async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-                while dc.buffered_amount().await > 0 && tokio::time::Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
                 let _ = dc.close().await;
             });
             return;
@@ -433,11 +436,26 @@ async fn writer_task(
             }
         }
     };
-    // A successfully-sent FIN/RESET makes the local write half terminal ON THE
-    // WIRE — the condition §6.5 retirement needs.
-    let mark_terminal_sent = |kind: Option<u8>| {
-        if kind == Some(FrameType::Fin as u8) || kind == Some(FrameType::Reset as u8) {
+    // A FIN/RESET handed to the transport makes the local write half terminal
+    // ON THE WIRE, the condition §6.5 retirement needs. It's marked in two
+    // steps around the send:
+    // - before: set the flag. `send` only queues (rule 4 in rtc_driver.rs),
+    //   so the peer can see the frame and close the channel before `send`
+    //   returns, and that close must not be policed as "closed mid-stream".
+    //   If the send fails, the stream is dead anyway.
+    // - after: check for retirement. Retiring closes the channel once nothing
+    //   is buffered; checked before the frame is queued, that close could
+    //   overtake the FIN itself.
+    let is_terminal =
+        |kind: Option<u8>| kind == Some(FrameType::Fin as u8) || kind == Some(FrameType::Reset as u8);
+    let mark_terminal = |kind: Option<u8>| {
+        if is_terminal(kind) {
             shared.state.lock().unwrap().local_terminal_sent = true;
+        }
+    };
+    let retire_if_terminal = |kind: Option<u8>| {
+        if is_terminal(kind) {
+            shared.state.lock().unwrap().local_terminal_queued = true;
             shared.maybe_retire();
         }
     };
@@ -447,10 +465,11 @@ async fn writer_task(
             life = life_rx.recv() => {
                 let Some(frame) = life else { break };
                 let kind = frame.first().copied();
+                mark_terminal(kind);
                 if !send(frame).await {
                     break;
                 }
-                mark_terminal_sent(kind);
+                retire_if_terminal(kind);
             }
             data = data_rx.recv() => {
                 let Some((frame, reserved)) = data else { break };
@@ -474,11 +493,12 @@ async fn writer_task(
                     }
                     let _ = tokio::time::timeout(Duration::from_millis(100), notified).await;
                 }
+                mark_terminal(kind);
                 if send(frame).await {
                     if reserved > 0 {
                         shared.flow.commit(shared.id, reserved);
                     }
-                    mark_terminal_sent(kind);
+                    retire_if_terminal(kind);
                 } else {
                     if reserved > 0 {
                         shared.flow.release(shared.id, reserved);
