@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -378,5 +379,82 @@ async fn webrtc_stale_close_leaves_newer_streams_alone() {
         // the same freed id again.
         drop(b);
         tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+}
+
+/// A UDP relay between a dialer and `server`, dropping about one packet in
+/// `one_in` in each direction (a fixed pseudo-random sequence, so runs are
+/// comparable). Returns the address to dial. Loopback never loses packets,
+/// which hides the races that matter at the end of a stream: a lost FIN or
+/// reset, and the retransmissions that then arrive together.
+async fn lossy_relay(server: SocketAddr, one_in: u64) -> SocketAddr {
+    let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = front.local_addr().unwrap();
+    let client: Arc<std::sync::Mutex<Option<SocketAddr>>> = Default::default();
+    // xorshift, seeded per direction
+    fn drop_next(state: &mut u64, one_in: u64) -> bool {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state % one_in == 0
+    }
+    {
+        let (front, back, client) = (front.clone(), back.clone(), client.clone());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+            while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                *client.lock().unwrap() = Some(from);
+                if !drop_next(&mut rng, one_in) {
+                    let _ = back.send_to(&buf[..n], server).await;
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut rng = 0xD1B5_4A32_D192_ED03u64;
+        while let Ok((n, _)) = back.recv_from(&mut buf).await {
+            let to = *client.lock().unwrap();
+            if let Some(to) = to {
+                if !drop_next(&mut rng, one_in) {
+                    let _ = front.send_to(&buf[..n], to).await;
+                }
+            }
+        }
+    });
+    addr
+}
+
+/// Streams must end cleanly under packet loss: every echo byte-exact and
+/// every FIN delivered, including when the FIN, the channel reset or their
+/// retransmissions are the packets lost. On loopback alone these never
+/// overlap. 3% loss each way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webrtc_streams_end_cleanly_under_loss() {
+    let (listener, addr) = start_echo_server().await;
+    let server: SocketAddr = format!("127.0.0.1:{}", listener.port()).parse().unwrap();
+    let relay = lossy_relay(server, 33).await;
+    let certhash = addr.rsplit(':').next().unwrap();
+    let relayed = format!("127.0.0.1:{}:{certhash}", relay.port());
+    let conn: Arc<dyn Conn> = Arc::from(timeout(T, kps::dial_webrtc(&relayed)).await.unwrap().unwrap());
+
+    // Many short streams, some concurrently, so FINs and resets get lost.
+    let mut tasks = Vec::new();
+    for w in 0..4 {
+        let conn = conn.clone();
+        tasks.push(tokio::spawn(async move {
+            for i in 0..40 {
+                let payload: Vec<u8> = (0..(4096 + 997 * i)).map(|j| ((j + w * 31 + i) % 251) as u8).collect();
+                let echoed = timeout(Duration::from_secs(30), echo_round_trip(conn.as_ref(), &payload))
+                    .await
+                    .unwrap_or_else(|_| panic!("worker {w} stream {i}: echo stalled"));
+                assert!(echoed == payload, "worker {w} stream {i}: echo differs");
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
     }
 }
