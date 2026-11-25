@@ -97,7 +97,8 @@ pub async fn dial_webrtc(addr: &str) -> Result<Box<dyn Conn>> {
     }));
 
     let answer = synthesize_webrtc_answer(&a, &ufrag, &pwd, &digest_to_fingerprint(&digest));
-    pc.with(move |pc| -> std::result::Result<(), String> {
+    let setup = pc
+        .with(move |pc| -> std::result::Result<(), String> {
         pc.add_local_candidate(host_candidate(local)?).map_err(|e| format!("local candidate: {e}"))?;
         let offer = pc.create_offer(None).map_err(|e| format!("create offer: {e}"))?;
         pc.set_local_description(Instant::now(), offer).map_err(|e| format!("set local: {e}"))?;
@@ -106,8 +107,13 @@ pub async fn dial_webrtc(addr: &str) -> Result<Box<dyn Conn>> {
         Ok(())
     })
     .await
-    .map_err(|e| Error::Dial(e.to_string()))?
-    .map_err(Error::Dial)?;
+    .map_err(|e| Error::Dial(e.to_string()))
+    .and_then(|r| r.map_err(Error::Dial));
+    if let Err(e) = setup {
+        // Ends the driver; its Closed state change stops the socket reader.
+        let _ = pc.close().await;
+        return Err(e);
+    }
 
     // Established = transport up AND mutual HELLO (SPEC §8).
     if let Err(e) = conn.wait_established().await {

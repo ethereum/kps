@@ -12,8 +12,7 @@
 //! the KPS protocol code (HELLO, flow control, framing, retirement) didn't
 //! have to change with the stack.
 //!
-//! Handlers run on the driver task, one at a time, in event order. Handle
-//! methods never wait for the driver except [`RTCPeerConnection::with`] and
+//! Handle methods never wait for the driver except [`RTCPeerConnection::with`] and
 //! `create_data_channel`, which must not be called from inside a handler.
 //!
 //! # Rules
@@ -46,6 +45,24 @@
 //!    default UDP buffers overflow under a burst; SCTP reads both as
 //!    congestion. The inbox sizes and socket buffers are set where the
 //!    sockets are made (`listener.rs`, `rtc_transport.rs`).
+//! 7. **Deliver a pass's messages before its channel closes.** `rtc` reports
+//!    messages on its read path and closes on its event path, so their order
+//!    is lost, and one `handle_read` can produce both: a peer's reset that
+//!    waited for unread data completes in the read that drains it. Handling
+//!    the close first dropped the stream's last frames (its FIN among them)
+//!    and failed the connection with "closed mid-stream". Channel handles are
+//!    never reused, so deferring a close to the end of the pass is safe.
+//! 8. **Close a channel only once everything sent on it is acknowledged.**
+//!    `rtc` doesn't order a reset behind data it has accepted but not yet
+//!    handed to SCTP, and discards writes to a stream it is resetting, so an
+//!    early close cut off the stream's tail and its FIN ("closed
+//!    mid-stream"). `close` therefore only marks the channel; the driver
+//!    closes it when its queue and `outstanding_bytes` are both empty.
+//!
+//! Handlers normally run on the driver task, one at a time, in event order.
+//! The exception is a handler registered after its event already happened
+//! (a late `on_open` or `on_close`): it runs at once on its own task, so it
+//! isn't ordered against the driver's later handlers.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -123,7 +140,6 @@ enum Cmd {
     CloseChannel(RTCDataChannelId),
     /// Deliver messages held for a channel whose `on_message` was just set.
     Replay(RTCDataChannelId),
-    SetLowThreshold(RTCDataChannelId, usize),
     With(WithFn),
     Close,
 }
@@ -206,12 +222,18 @@ impl RTCDataChannel {
     }
 
     pub(crate) async fn set_buffered_amount_low_threshold(&self, threshold: usize) {
+        // The driver compares against this itself (publish_buffered); rtc's
+        // own low-water event isn't used.
         self.inner.low_threshold.store(threshold, Ordering::SeqCst);
-        let _ = self.cmd.send(Cmd::SetLowThreshold(self.id, threshold));
     }
 
     pub(crate) async fn on_buffered_amount_low(&self, f: OnEventFn) {
         *self.inner.on_low.lock().unwrap() = Some(f);
+        // Registered after the channel closed (and its handlers were
+        // dropped): drop this one too, or it keeps the stream alive.
+        if self.ready_state() == RTCDataChannelState::Closed {
+            self.inner.on_low.lock().unwrap().take();
+        }
     }
 
     /// Runs `f` once the channel opens, or now if it already has. A caller
@@ -236,6 +258,12 @@ impl RTCDataChannel {
     /// replayed to it first, in order, on the driver task.
     pub(crate) fn on_message(&self, f: OnMessageFn) {
         *self.inner.on_message.lock().unwrap() = Some(f);
+        if self.ready_state() == RTCDataChannelState::Closed {
+            // Too late: cleanup already ran. Drop it rather than keep the
+            // stream alive through it.
+            self.inner.on_message.lock().unwrap().take();
+            return;
+        }
         let _ = self.cmd.send(Cmd::Replay(self.id));
     }
 
@@ -251,7 +279,15 @@ impl RTCDataChannel {
         }
     }
 
+    /// Starts closing: the driver resets the channel once everything sent
+    /// on it is acknowledged (rule 8). Sends fail from now on.
     pub(crate) async fn close(&self) -> Result<(), DriverError> {
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            if *st != RTCDataChannelState::Closed {
+                *st = RTCDataChannelState::Closing;
+            }
+        }
         let _ = self.cmd.send(Cmd::CloseChannel(self.id));
         Ok(())
     }
@@ -344,6 +380,7 @@ pub(crate) fn spawn(pc: rtc::peer_connection::RTCPeerConnection, io: DriverIo) -
         shared,
         channels: HashMap::new(),
         early: HashMap::new(),
+        closed: Vec::new(),
         terminal: false,
         sock_local: None,
     };
@@ -371,6 +408,8 @@ struct Channel {
     /// For the low-threshold crossing (fires `on_low` when the buffered
     /// amount falls to or below the threshold from above).
     above: bool,
+    /// A close was requested while data was still unacknowledged (rule 8).
+    close_when_drained: bool,
 }
 
 struct Driver {
@@ -384,6 +423,9 @@ struct Driver {
     channels: HashMap<RTCDataChannelId, Channel>,
     /// Messages for a channel the driver hasn't seen open yet.
     early: HashMap<RTCDataChannelId, Vec<DataChannelMessage>>,
+    /// Channels whose close event this pass has seen; closed after the
+    /// pass's messages are delivered (rule 7).
+    closed: Vec<RTCDataChannelId>,
     terminal: bool,
     sock_local: Option<SocketAddr>,
 }
@@ -439,6 +481,9 @@ impl Driver {
                     Some(c) => {
                         self.command(c).await;
                         for _ in 1..CMD_BATCH {
+                            if self.terminal {
+                                break;
+                            }
                             let Ok(c) = self.cmd_rx.try_recv() else { break };
                             self.command(c).await;
                         }
@@ -518,9 +563,16 @@ impl Driver {
                         .await;
                 }
             }
+            // Rule 7: closes after the messages that preceded them.
+            for id in std::mem::take(&mut self.closed) {
+                self.channel_closed(id).await;
+            }
             // Handlers queue sends as commands; run them before publishing the
             // buffered amounts so the next writer decision sees them.
             for _ in 0..CMD_BATCH {
+                if self.terminal {
+                    break;
+                }
                 let Ok(c) = self.cmd_rx.try_recv() else { break };
                 worked = true;
                 self.command(c).await;
@@ -544,6 +596,13 @@ impl Driver {
             ch.inner.outstanding.store(out, Ordering::SeqCst);
             let threshold = ch.inner.low_threshold.load(Ordering::SeqCst);
             let buffered = ch.inner.buffered();
+            if ch.close_when_drained && buffered == 0 {
+                // Rule 8: the close that was waiting for this.
+                ch.close_when_drained = false;
+                if let Some(mut dc) = self.pc.data_channel(*id) {
+                    let _ = dc.close();
+                }
+            }
             if buffered > threshold {
                 ch.above = true;
             } else if ch.above {
@@ -596,7 +655,8 @@ impl Driver {
                     ch.inner.set_state(RTCDataChannelState::Closing);
                 }
             }
-            RTCDataChannelEvent::OnClose(id) => self.channel_closed(id).await,
+            // Rule 7: run after this pass's messages, not now.
+            RTCDataChannelEvent::OnClose(id) => self.closed.push(id),
             _ => {}
         }
     }
@@ -613,7 +673,7 @@ impl Driver {
         } else {
             // The peer opened it (DCEP): surface it.
             let inner = Arc::new(DcInner::new(RTCDataChannelState::Open));
-            self.channels.insert(id, Channel { inner: inner.clone(), above: false });
+            self.channels.insert(id, Channel { inner: inner.clone(), above: false, close_when_drained: false });
             let Some(cmd) = self.cmd_tx.upgrade() else { return };
             let dc = Arc::new(RTCDataChannel { id, inner, cmd });
             let fut = self.shared.on_data_channel.lock().unwrap().as_mut().map(|f| f(dc));
@@ -651,10 +711,16 @@ impl Driver {
 
     async fn deliver(&mut self, id: RTCDataChannelId, m: DataChannelMessage) {
         let Some(ch) = self.channels.get(&id) else {
-            // Before its open event: hold it (bounded).
+            // A message for a channel whose open event hasn't been handled
+            // yet: hold it until channel_open. Peer-opened channels open in
+            // the same pass that brings their first message, and closes run
+            // after a pass's messages (rule 7), so this should stay tiny; the
+            // cap only guards against a channel that never opens.
             let q = self.early.entry(id).or_default();
             if q.len() < 64 {
                 q.push(m);
+            } else if kps_debug() {
+                eprintln!("[kps-rtc] early queue full for channel {id}: dropping a message");
             }
             return;
         };
@@ -705,7 +771,7 @@ impl Driver {
                             eprintln!("[kps-rtc] {} created channel {id} ({label})", self.io.local);
                         }
                         let inner = Arc::new(DcInner::new(RTCDataChannelState::Connecting));
-                        self.channels.insert(id, Channel { inner: inner.clone(), above: false });
+                        self.channels.insert(id, Channel { inner: inner.clone(), above: false, close_when_drained: false });
                         match self.cmd_tx.upgrade() {
                             Some(cmd) => Ok(Arc::new(RTCDataChannel { id, inner, cmd })),
                             None => Err(DriverError("peer connection closed".into())),
@@ -736,22 +802,35 @@ impl Driver {
                 // Rule 3: publish the new outstanding count before releasing
                 // the queued bytes, so the buffered amount never reads 0
                 // while these bytes are unacknowledged.
-                if let Some(ch) = self.channels.get(&id) {
+                if let Some(ch) = self.channels.get_mut(&id) {
                     if let Some(out) = outstanding {
                         ch.inner.outstanding.store(out, Ordering::SeqCst);
+                    }
+                    // Record a crossing above the low-water mark here, while
+                    // these bytes still count: if SACKs bring the total back
+                    // down before the next publish, that publish must still
+                    // see the crossing and fire on_low, or a writer parked on
+                    // it sleeps out its timeout instead.
+                    if ch.inner.buffered() > ch.inner.low_threshold.load(Ordering::SeqCst) {
+                        ch.above = true;
                     }
                     ch.inner.queued.fetch_sub(n, Ordering::SeqCst);
                 }
             }
             Cmd::Replay(id) => self.replay(id).await,
             Cmd::CloseChannel(id) => {
-                if let Some(mut dc) = self.pc.data_channel(id) {
-                    let _ = dc.close();
-                }
-            }
-            Cmd::SetLowThreshold(id, t) => {
-                if let Some(mut dc) = self.pc.data_channel(id) {
-                    dc.set_buffered_amount_low_threshold(t.min(u32::MAX as usize) as u32);
+                // Rule 8: not while anything sent is unacknowledged.
+                let drained = match self.channels.get_mut(&id) {
+                    Some(ch) if ch.inner.buffered() > 0 => {
+                        ch.close_when_drained = true;
+                        false
+                    }
+                    _ => true,
+                };
+                if drained {
+                    if let Some(mut dc) = self.pc.data_channel(id) {
+                        let _ = dc.close();
+                    }
                 }
             }
             Cmd::With(f) => f(&mut self.pc),

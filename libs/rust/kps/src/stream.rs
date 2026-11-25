@@ -83,7 +83,14 @@ struct State {
     peer_reset: Option<StreamError>, // peer RESET observed
     peer_stop: Option<StreamError>,  // peer STOP_SENDING observed
     local_terminal: Option<Terminal>,
-    local_terminal_sent: bool, // FIN/RESET actually handed to the transport
+    // The local FIN/RESET, in two steps around handing it to the transport
+    // (see writer_task): `local_terminal_sent` is set just before, so a peer
+    // that closes on seeing it isn't policed as "closed mid-stream";
+    // `local_terminal_queued` is set once it's queued, and only then may we
+    // initiate our own close. The close must never be queued ahead of the
+    // frame: rtc discards writes to a stream it is resetting.
+    local_terminal_sent: bool,
+    local_terminal_queued: bool,
     read_cancel: bool,         // local cancel_read
     drop_data: bool,   // writer task discards queued-but-unsent DATA
     dc_open: bool,
@@ -221,10 +228,11 @@ impl Shared {
     fn maybe_retire(&self) {
         let (wire_complete, drained, dc_closed, fire) = {
             let mut st = self.state.lock().unwrap();
-            // Wire-complete needs the local terminal frame ON THE WIRE (handed
-            // to the transport by the writer task), not merely queued.
+            // Wire-complete needs the local terminal frame handed to the
+            // transport by the writer task (queued behind our earlier frames),
+            // not merely produced.
             let wire_complete =
-                st.local_terminal_sent && (st.peer_fin || st.peer_reset.is_some());
+                st.local_terminal_queued && (st.peer_fin || st.peer_reset.is_some());
             let drained = st.inbuf.is_empty();
             let dc_closed = st.dc_closed;
             let mut fire = false;
@@ -238,14 +246,11 @@ impl Shared {
             return;
         }
         if !dc_closed {
-            // Let the terminal frame flush out of the SCTP send buffer before
-            // resetting the stream (bounded so close stays prompt).
+            // Initiate the close. The driver holds it until everything sent
+            // on the channel is acknowledged (rule 8 in rtc_driver.rs), so the
+            // FIN can't be overtaken by the reset.
             let dc = self.dc.clone();
             tokio::spawn(async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-                while dc.buffered_amount().await > 0 && tokio::time::Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
                 let _ = dc.close().await;
             });
             return;
@@ -450,6 +455,7 @@ async fn writer_task(
     };
     let retire_if_terminal = |kind: Option<u8>| {
         if is_terminal(kind) {
+            shared.state.lock().unwrap().local_terminal_queued = true;
             shared.maybe_retire();
         }
     };
