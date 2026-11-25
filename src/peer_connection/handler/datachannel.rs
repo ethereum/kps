@@ -20,6 +20,11 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub(crate) struct DataChannelHandlerContext {
+    /// KPS PATCH (dcep-open-reuse): streams whose channel was closed early
+    /// because a new channel's DATA_CHANNEL_OPEN arrived on its id; the old
+    /// stream's SCTPStreamClosed is still queued and must not close the new
+    /// channel.
+    pub(crate) stale_stream_closed: std::collections::HashSet<sctp::StreamId>,
     pub(crate) read_outs: VecDeque<TaggedRTCMessageInternal>,
     pub(crate) write_outs: VecDeque<TaggedRTCMessageInternal>,
     pub(crate) event_outs: VecDeque<TaggedRTCEventInternal>,
@@ -36,6 +41,7 @@ pub(crate) struct DataChannelHandlerContext {
 impl DataChannelHandlerContext {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
+            stale_stream_closed: std::collections::HashSet::new(),
             read_outs: VecDeque::new(),
             write_outs: VecDeque::new(),
             event_outs: VecDeque::new(),
@@ -174,6 +180,24 @@ impl<'a>
 
             let stream_id = message.stream_id;
             let transport = msg.transport;
+
+            // KPS PATCH (dcep-open-reuse): a DATA_CHANNEL_OPEN on an id that
+            // still maps to a channel means the peer has finished resetting
+            // the old stream and reused the id; only this layer hasn't caught
+            // up, because SCTP delivers this read before the old stream's
+            // SCTPStreamClosed event. Fed to the old channel, the OPEN was lost:
+            // the new channel was never created or acknowledged, and the peer
+            // waited forever. Close the old channel now and accept the new
+            // one; the old stream's queued close event is then stale.
+            if message.ppi == PayloadProtocolIdentifier::Dcep
+                && message.payload.first() == Some(&0x03)
+                && self.data_channels.get_by_stream(&stream_id).is_some()
+            {
+                if let Some(old) = self.data_channels.remove_by_stream(&stream_id) {
+                    self.ctx.stale_stream_closed.insert(stream_id);
+                    self.announce_closed(now, old);
+                }
+            }
 
             // SCTP addresses channels by stream id; everything leaving this handler towards
             // the application is keyed by handle instead.
@@ -404,8 +428,10 @@ impl<'a>
                 // the DTLS role is resolved and the negotiated stream count is known. This is
                 // the first moment a stream id can be chosen correctly, and therefore the
                 // moment it is chosen at all (RFC 8832 §6).
+                // Nothing can be blocked yet: no stream has been reset on a
+                // newly connected association.
                 self.data_channels
-                    .assign_stream_ids(self.dtls_role, self.max_channels)?;
+                    .assign_stream_ids(self.dtls_role, self.max_channels, &|_| false)?;
 
                 // Out-of-band negotiated channels have no DCEP handshake, so they are
                 // open immediately and fire the open event here. In-band channels stay
@@ -453,6 +479,11 @@ impl<'a>
             }
 
             RTCEventInternal::SCTPStreamClosed(_association_handle, stream_id) => {
+                // KPS PATCH (dcep-open-reuse): the old stream's close, for a
+                // channel already closed when a new one opened on its id.
+                if self.ctx.stale_stream_closed.remove(&stream_id) {
+                    return Ok(());
+                }
                 if let Some(dc) = self.data_channels.remove_by_stream(&stream_id) {
                     self.announce_closed(now, dc);
                 }
@@ -1215,5 +1246,94 @@ mod tests {
                 .any(|e| matches!(e, DataChannelEvent::Message(_))),
             "a buffered message must never be delivered after the timeout"
         );
+    }
+
+    // KPS PATCH (reset-reuse-guard, dcep-open-reuse) tests.
+
+    fn open_message(association_handle: usize, stream_id: u16) -> DataChannelMessage {
+        use datachannel::message::message_channel_open::{ChannelType, DataChannelOpen};
+        let open = Message::DataChannelOpen(DataChannelOpen {
+            channel_type: ChannelType::Reliable,
+            priority: 0,
+            reliability_parameter: 0,
+            label: b"reuse".to_vec(),
+            protocol: vec![],
+        })
+        .marshal()
+        .unwrap();
+        DataChannelMessage {
+            association_handle,
+            stream_id,
+            ppi: PayloadProtocolIdentifier::Dcep,
+            payload: BytesMut::from(&open[..]),
+            negotiated: false,
+        }
+    }
+
+    fn closes(ctx: &DataChannelHandlerContext) -> Vec<RTCDataChannelId> {
+        ctx.event_outs
+            .iter()
+            .filter_map(|e| match &e.event {
+                RTCEventInternal::RTCPeerConnectionEvent(RTCPeerConnectionEvent::OnDataChannel(
+                    RTCDataChannelEvent::OnClose(id),
+                )) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stream id assignment skips ids the caller reports as blocked.
+    #[test]
+    fn assign_stream_ids_skips_blocked_ids() {
+        let unassigned = || {
+            let mut dc = in_band_channel(0);
+            dc.stream_id = None;
+            dc
+        };
+        let (mut reg, handles) = registry(vec![unassigned(), unassigned()]);
+        reg.assign_stream_ids(RTCDtlsRole::Client, None, &|sid| sid == 0 || sid == 4)
+            .unwrap();
+        assert_eq!(reg.get(&handles[0]).unwrap().stream_id, Some(2));
+        assert_eq!(reg.get(&handles[1]).unwrap().stream_id, Some(6));
+    }
+
+    /// A DATA_CHANNEL_OPEN on an id that still maps to a channel (its stream's
+    /// close event not processed yet) closes the old channel and opens the new
+    /// one; the old stream's late close event then leaves the new one alone.
+    #[test]
+    fn open_on_a_reused_id_replaces_the_old_channel() {
+        let now = Instant::now();
+        let mut ctx = DataChannelHandlerContext::new(now);
+        let (mut data_channels, _) = registry(vec![]);
+        let mut stats = RTCStatsAccumulator::new();
+        let read = |handler: &mut DataChannelHandler<'_>, m| {
+            handler
+                .handle_read(TaggedRTCMessageInternal {
+                    now,
+                    transport: TransportContext::default(),
+                    message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(m)),
+                })
+                .unwrap()
+        };
+        let mut handler =
+            DataChannelHandler::new(&mut ctx, &mut data_channels, &mut stats, None, RTCDtlsRole::Server, None);
+        read(&mut handler, open_message(0, 3));
+        let old = handler.data_channels.handle_of_stream(&3).unwrap();
+        // The peer reset stream 3 and reused it before our close event ran.
+        read(&mut handler, open_message(0, 3));
+        let new = handler.data_channels.handle_of_stream(&3).unwrap();
+        assert_ne!(old, new, "a new channel took the id");
+        // The old stream's close event, queued behind the read.
+        handler
+            .handle_event(TaggedRTCEventInternal { now, event: RTCEventInternal::SCTPStreamClosed(0, 3) })
+            .unwrap();
+        assert_eq!(handler.data_channels.handle_of_stream(&3), Some(new), "the stale close leaves the new channel");
+        // A real close of the new stream still works.
+        handler
+            .handle_event(TaggedRTCEventInternal { now, event: RTCEventInternal::SCTPStreamClosed(0, 3) })
+            .unwrap();
+        assert_eq!(handler.data_channels.handle_of_stream(&3), None);
+        drop(handler);
+        assert_eq!(closes(&ctx), vec![old, new], "each channel is closed exactly once");
     }
 }
