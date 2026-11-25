@@ -52,7 +52,13 @@ use bytes::{Bytes, BytesMut};
 use log::{debug, error, trace, warn};
 use rand::random;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// KPS PATCH (reset-dedupe): how many of the peer's performed reset requests
+/// to remember. A retransmission comes after about an RTO, so this must cover
+/// every reset performed in that time even under heavy stream churn: 65,536
+/// costs about 1 MiB at most and makes eviction irrelevant in practice.
+const PERFORMED_RECONFIG_REQUESTS_MAX: usize = 65_536;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -184,6 +190,11 @@ pub struct Association {
     my_next_rsn: u32,
     reconfigs: HashMap<u32, ChunkReconfig>,
     reconfig_requests: HashMap<u32, ParamOutgoingResetRequest>,
+    // KPS PATCH (reset-dedupe): the peer's reset requests we have already
+    // performed (set for lookup, queue for eviction order), bounded by
+    // PERFORMED_RECONFIG_REQUESTS_MAX. See handle_reconfig_param.
+    performed_reconfig_requests: HashSet<u32>,
+    performed_reconfig_order: VecDeque<u32>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -288,6 +299,8 @@ impl Default for Association {
             my_next_rsn: 0,
             reconfigs: HashMap::default(),
             reconfig_requests: HashMap::default(),
+            performed_reconfig_requests: HashSet::default(),
+            performed_reconfig_order: VecDeque::new(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -1732,6 +1745,28 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+            // KPS PATCH (reset-dedupe): a request we already performed is a
+            // retransmission (our response was lost). Answer it again and
+            // touch no streams (RFC 6525 §5.2.1). Performing it again would
+            // reset whatever stream has reused those ids since: a new
+            // channel the peer never closed.
+            if self
+                .performed_reconfig_requests
+                .contains(&p.reconfig_request_sequence_number)
+            {
+                debug!(
+                    "[{}] resetStream(): request {} already performed, re-sending response",
+                    self.side, p.reconfig_request_sequence_number
+                );
+                reply.push(self.create_packet(vec![Box::new(ChunkReconfig {
+                    param_a: Some(Box::new(ParamReconfigResponse {
+                        reconfig_response_sequence_number: p.reconfig_request_sequence_number,
+                        result: ReconfigResult::SuccessPerformed,
+                    })),
+                    param_b: None,
+                })]));
+                return Ok(());
+            }
             self.reconfig_requests
                 .insert(p.reconfig_request_sequence_number, p.clone());
             self.reset_streams_if_any(p, true, reply)?;
@@ -2121,6 +2156,22 @@ impl Association {
             if draining.is_empty() {
                 self.reconfig_requests
                     .remove(&p.reconfig_request_sequence_number);
+                // KPS PATCH (reset-dedupe): remember it, so a retransmission
+                // isn't performed again. A set, not a high-water mark:
+                // requests can complete out of order when one is deferred
+                // for undrained data.
+                if self
+                    .performed_reconfig_requests
+                    .insert(p.reconfig_request_sequence_number)
+                {
+                    self.performed_reconfig_order
+                        .push_back(p.reconfig_request_sequence_number);
+                    if self.performed_reconfig_order.len() > PERFORMED_RECONFIG_REQUESTS_MAX {
+                        if let Some(old) = self.performed_reconfig_order.pop_front() {
+                            self.performed_reconfig_requests.remove(&old);
+                        }
+                    }
+                }
             } else {
                 debug!(
                     "[{}] resetStream(): deferring reset of {:?}, application has not drained",

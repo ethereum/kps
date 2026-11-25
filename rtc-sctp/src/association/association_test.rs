@@ -1791,3 +1791,92 @@ mod duplicate_report_test;
 
 #[path = "stream_scheduler_test.rs"]
 mod stream_scheduler_test;
+
+// KPS PATCH (reset-dedupe) tests.
+
+fn reset_request(rsn: u32, stream: u16, sender_last_tsn: u32) -> Box<dyn Param> {
+    Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: rsn,
+        reconfig_response_sequence_number: 0,
+        sender_last_tsn,
+        stream_identifiers: vec![stream],
+    })
+}
+
+fn has_performed_response(reply: &[Packet], rsn: u32) -> bool {
+    reply.iter().flat_map(|p| p.chunks.iter()).any(|c| {
+        c.as_any()
+            .downcast_ref::<ChunkReconfig>()
+            .and_then(|r| r.param_a.as_ref())
+            .and_then(|p| p.as_any().downcast_ref::<ParamReconfigResponse>())
+            .is_some_and(|r| {
+                r.reconfig_response_sequence_number == rsn
+                    && r.result == ReconfigResult::SuccessPerformed
+            })
+    })
+}
+
+/// A retransmitted reset request (our response was lost) must be answered
+/// again without resetting anything: by then the stream id may belong to a
+/// new stream the peer never closed.
+#[test]
+fn test_duplicate_reset_request_is_answered_not_performed_again() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let tsn = a.peer_last_tsn;
+    assert!(a.create_stream(2, true, ppi).is_some());
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(7, 2, tsn), &mut reply)?;
+    assert!(!a.streams.contains_key(&2), "first request resets stream 2");
+    assert!(has_performed_response(&reply, 7));
+
+    // A new stream reuses id 2; then the old request arrives again.
+    assert!(a.create_stream(2, true, ppi).is_some());
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(7, 2, tsn), &mut reply)?;
+    assert!(a.streams.contains_key(&2), "the retransmission must not reset the new stream 2");
+    assert!(has_performed_response(&reply, 7), "but it is answered again");
+    Ok(())
+}
+
+/// Requests can be performed out of order (one deferred for unread data, or
+/// several outstanding at once). A first arrival of an earlier request must
+/// still be performed: the record is a set, not a high-water mark.
+#[test]
+fn test_reset_requests_performed_out_of_order() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let tsn = a.peer_last_tsn;
+    assert!(a.create_stream(2, true, ppi).is_some());
+    assert!(a.create_stream(4, true, ppi).is_some());
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(9, 4, tsn), &mut reply)?;
+    a.handle_reconfig_param(&reset_request(8, 2, tsn), &mut reply)?;
+    assert!(!a.streams.contains_key(&4));
+    assert!(!a.streams.contains_key(&2), "request 8, first seen after 9, is performed");
+    Ok(())
+}
+
+/// The record must outlast heavy churn: many other resets can be performed
+/// before a lost response's request is retransmitted (about an RTO later).
+#[test]
+fn test_duplicate_reset_request_detected_after_many_other_resets() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let tsn = a.peer_last_tsn;
+    let mut reply = vec![];
+    assert!(a.create_stream(2, true, ppi).is_some());
+    a.handle_reconfig_param(&reset_request(1, 2, tsn), &mut reply)?;
+    for rsn in 2..5_000u32 {
+        assert!(a.create_stream(4, true, ppi).is_some());
+        a.handle_reconfig_param(&reset_request(rsn, 4, tsn), &mut reply)?;
+    }
+    assert!(a.create_stream(2, true, ppi).is_some());
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(1, 2, tsn), &mut reply)?;
+    assert!(a.streams.contains_key(&2), "request 1 is still recognised as performed");
+    assert!(has_performed_response(&reply, 1));
+    Ok(())
+}
