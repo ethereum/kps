@@ -16,6 +16,7 @@ use log::{debug, warn};
 use sctp::PayloadProtocolIdentifier;
 use shared::TransportContext;
 use shared::error::{Error, Result};
+use shared::marshal::Unmarshal;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -189,8 +190,20 @@ impl<'a>
             // the new channel was never created or acknowledged, and the peer
             // waited forever. Close the old channel now and accept the new
             // one; the old stream's queued close event is then stale.
+            //
+            // This assumes exactly one SCTPStreamClosed is still queued for
+            // the old stream, which holds when the peer finished its reset
+            // before reusing the id. An OPEN on a mapped id with no close
+            // pending (a peer that reuses ids early, or a duplicate OPEN)
+            // would make the next real close of that id be swallowed, so the
+            // new channel would never close.
             if message.ppi == PayloadProtocolIdentifier::Dcep
-                && message.payload.first() == Some(&0x03)
+                && matches!(
+                    ::datachannel::message::message_type::MessageType::unmarshal(
+                        &mut &message.payload[..]
+                    ),
+                    Ok(::datachannel::message::message_type::MessageType::DataChannelOpen)
+                )
                 && self.data_channels.get_by_stream(&stream_id).is_some()
             {
                 if let Some(old) = self.data_channels.remove_by_stream(&stream_id) {
