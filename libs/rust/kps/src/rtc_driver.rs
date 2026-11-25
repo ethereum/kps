@@ -697,11 +697,6 @@ impl Driver {
     async fn channel_event(&mut self, dce: RTCDataChannelEvent) {
         match dce {
             RTCDataChannelEvent::OnOpen(id) => self.channel_open(id).await,
-            RTCDataChannelEvent::OnClosing(id) => {
-                if let Some(ch) = self.channels.get(&id) {
-                    ch.inner.set_state(RTCDataChannelState::Closing);
-                }
-            }
             // Rule 7: run after this pass's messages, not now.
             RTCDataChannelEvent::OnClose(id) => self.closed.push(id),
             _ => {}
@@ -711,8 +706,14 @@ impl Driver {
     async fn channel_open(&mut self, id: RTCDataChannelId) {
         if let Some(ch) = self.channels.get(&id) {
             // State first, then the handler: RTCDataChannel::on_open relies
-            // on this order.
-            ch.inner.set_state(RTCDataChannelState::Open);
+            // on this order. Only from Connecting: a close() while the
+            // channel was connecting must not be undone by its open.
+            {
+                let mut st = ch.inner.state.lock().unwrap();
+                if *st == RTCDataChannelState::Connecting {
+                    *st = RTCDataChannelState::Open;
+                }
+            }
             let f = ch.inner.on_open.lock().unwrap().take();
             if let Some(f) = f {
                 f().await;
