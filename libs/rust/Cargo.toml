@@ -23,7 +23,7 @@ anyhow = "1"
 # TEMPORARY (draft): pinned to botreevo/kps until ethereum/kps#14 merges into
 # vendor/rtc; then this switches back to ethereum/kps at the merged rev.
 [patch.crates-io]
-rtc = { git = "https://github.com/botreevo/kps.git", rev = "1d41ca0a89d63360fcc0594d1566b11ad100cdb9" }
-rtc-sctp = { git = "https://github.com/botreevo/kps.git", rev = "1d41ca0a89d63360fcc0594d1566b11ad100cdb9" }
-rtc-dtls = { git = "https://github.com/botreevo/kps.git", rev = "1d41ca0a89d63360fcc0594d1566b11ad100cdb9" }
-rtc-datachannel = { git = "https://github.com/botreevo/kps.git", rev = "1d41ca0a89d63360fcc0594d1566b11ad100cdb9" }
+rtc = { git = "https://github.com/botreevo/kps.git", rev = "ca4491cea57a9d4589a45265bae5992f44e941ba" }
+rtc-sctp = { git = "https://github.com/botreevo/kps.git", rev = "ca4491cea57a9d4589a45265bae5992f44e941ba" }
+rtc-dtls = { git = "https://github.com/botreevo/kps.git", rev = "ca4491cea57a9d4589a45265bae5992f44e941ba" }
+rtc-datachannel = { git = "https://github.com/botreevo/kps.git", rev = "ca4491cea57a9d4589a45265bae5992f44e941ba" }
