@@ -160,6 +160,9 @@ impl DataChannelRegistry {
         &mut self,
         role: RTCDtlsRole,
         max_channels: Option<StreamId>,
+        // KPS PATCH (reset-reuse-guard): ids not to hand out yet because a
+        // reset we requested for them isn't finished at the peer.
+        blocked: &dyn Fn(StreamId) -> bool,
     ) -> Result<()> {
         let mut next: StreamId = match role {
             RTCDtlsRole::Client => 0,
@@ -178,7 +181,7 @@ impl DataChannelRegistry {
             // Skip ids already claimed — by an out-of-band channel the application pinned, or
             // by one the peer opened first. Carrying the cursor across iterations rather than
             // restarting the scan keeps this a single pass.
-            while next < max.saturating_sub(1) && self.stream_id_in_use(&next) {
+            while next < max.saturating_sub(1) && (self.stream_id_in_use(&next) || blocked(next)) {
                 next += 2;
             }
             if next >= max.saturating_sub(1) {

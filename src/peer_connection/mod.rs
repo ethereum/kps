@@ -2011,8 +2011,16 @@ impl RTCPeerConnection {
             && matches!(dtls_role, RTCDtlsRole::Client | RTCDtlsRole::Server)
         {
             let max_channels = self.sctp_transport().max_channels();
+            // KPS PATCH (reset-reuse-guard): skip ids whose old stream the
+            // peer may still have registered.
+            let pending: std::collections::HashSet<crate::data_channel::StreamId> = self
+                .sctp_transport()
+                .sctp_associations
+                .get(&handle)
+                .map(|a| a.pending_outgoing_resets().collect())
+                .unwrap_or_default();
             self.data_channels
-                .assign_stream_ids(dtls_role, max_channels)?;
+                .assign_stream_ids(dtls_role, max_channels, &|sid| pending.contains(&sid))?;
 
             let data_channel = self
                 .data_channels

@@ -1880,3 +1880,49 @@ fn test_duplicate_reset_request_detected_after_many_other_resets() -> Result<()>
     assert!(has_performed_response(&reply, 1));
     Ok(())
 }
+
+// KPS PATCH (reset-reuse-guard) tests.
+
+fn reconfig_response(rsn: u32, result: ReconfigResult) -> Box<dyn Param> {
+    Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: rsn,
+        result,
+    })
+}
+
+/// A stream we reset stays blocked for reuse until the peer has performed
+/// the reset: through an In Progress answer, until the final one.
+#[test]
+fn test_pending_outgoing_reset_lasts_until_performed() -> Result<()> {
+    let mut a = timed_test_association();
+    let now = Instant::now();
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let mut stream = a.open_stream(2, ppi)?;
+    stream.close(now)?;
+    assert!(a.has_pending_outgoing_reset(2), "blocked as soon as the reset is queued");
+    a.gather_outbound(now);
+    let rsn = *a.reconfigs.keys().next().expect("the reset request was sent");
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reconfig_response(rsn, ReconfigResult::InProgress), &mut reply)?;
+    assert!(a.has_pending_outgoing_reset(2), "In Progress is not done");
+    a.handle_reconfig_param(&reconfig_response(rsn, ReconfigResult::SuccessPerformed), &mut reply)?;
+    assert!(!a.has_pending_outgoing_reset(2), "the final answer releases it");
+    assert_eq!(a.pending_outgoing_resets().count(), 0);
+    Ok(())
+}
+
+/// The reset we send in answer to the peer's is ours too: its id is blocked
+/// until the peer performs it.
+#[test]
+fn test_answering_reset_blocks_reuse() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let tsn = a.peer_last_tsn;
+    assert!(a.create_stream(4, true, ppi).is_some());
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(50, 4, tsn), &mut reply)?;
+    assert!(!a.streams.contains_key(&4), "the peer's reset is performed");
+    assert!(a.has_pending_outgoing_reset(4), "our answering reset is pending");
+    Ok(())
+}

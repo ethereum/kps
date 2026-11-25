@@ -195,6 +195,12 @@ pub struct Association {
     // PERFORMED_RECONFIG_REQUESTS_MAX. See handle_reconfig_param.
     performed_reconfig_requests: HashSet<u32>,
     performed_reconfig_order: VecDeque<u32>,
+    // KPS PATCH (reset-reuse-guard): streams named in our own reset requests
+    // that the peer hasn't finished performing (queued, sent and unanswered,
+    // or answered In Progress), counted per stream; and, for requests
+    // answered In Progress, the streams they named, until the final answer.
+    outgoing_resets_pending: HashMap<StreamId, usize>,
+    answered_in_progress: HashMap<u32, Vec<StreamId>>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -301,6 +307,8 @@ impl Default for Association {
             reconfig_requests: HashMap::default(),
             performed_reconfig_requests: HashSet::default(),
             performed_reconfig_order: VecDeque::new(),
+            outgoing_resets_pending: HashMap::default(),
+            answered_in_progress: HashMap::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -820,6 +828,21 @@ impl Association {
                 association: self,
             })
         }
+    }
+
+    /// KPS PATCH (reset-reuse-guard): whether a reset we requested for
+    /// `stream_identifier` is still unfinished at the peer. Its id must not be
+    /// reused for a new channel until it is: the peer may still have the old
+    /// stream registered, and would take the new channel's first message as
+    /// data on the closing stream and lose it.
+    pub fn has_pending_outgoing_reset(&self, stream_identifier: StreamId) -> bool {
+        self.outgoing_resets_pending.contains_key(&stream_identifier)
+    }
+
+    /// KPS PATCH (reset-reuse-guard): every stream for which
+    /// [`has_pending_outgoing_reset`](Self::has_pending_outgoing_reset) holds.
+    pub fn pending_outgoing_resets(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.outgoing_resets_pending.keys().copied()
     }
 
     /// The identifiers of every stream currently open on this association.
@@ -1772,7 +1795,33 @@ impl Association {
             self.reset_streams_if_any(p, true, reply)?;
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
-            self.reconfigs.remove(&p.reconfig_response_sequence_number);
+            // KPS PATCH (reset-reuse-guard): track when the peer has finished
+            // performing our request. In Progress means not yet: it answers
+            // again once done, after we have stopped tracking the request.
+            let rsn = p.reconfig_response_sequence_number;
+            let named = self.reconfigs.get(&rsn).and_then(|c| {
+                c.param_a
+                    .as_ref()?
+                    .as_any()
+                    .downcast_ref::<ParamOutgoingResetRequest>()
+                    .map(|r| r.stream_identifiers.clone())
+            });
+            if p.result == ReconfigResult::InProgress {
+                if let Some(named) = named {
+                    self.answered_in_progress.insert(rsn, named);
+                }
+            } else {
+                let named = named.or_else(|| self.answered_in_progress.remove(&rsn));
+                for sid in named.unwrap_or_default() {
+                    if let Some(n) = self.outgoing_resets_pending.get_mut(&sid) {
+                        *n -= 1;
+                        if *n == 0 {
+                            self.outgoing_resets_pending.remove(&sid);
+                        }
+                    }
+                }
+            }
+            self.reconfigs.remove(&rsn);
             if self.reconfigs.is_empty() {
                 self.timers.stop(Timer::Reconfig);
             }
@@ -2190,6 +2239,11 @@ impl Association {
         // Answer incoming reset requests with the same reset request, but with
         // reconfig_response_sequence_number.
         if !sis_to_reset.is_empty() {
+            // KPS PATCH (reset-reuse-guard): this answering reset is ours too;
+            // its ids stay blocked until the peer has performed it.
+            for sid in &sis_to_reset {
+                *self.outgoing_resets_pending.entry(*sid).or_default() += 1;
+            }
             let rsn = self.generate_next_rsn();
             let tsn = self.my_next_tsn - 1;
 
@@ -3330,6 +3384,8 @@ impl Association {
 
         self.pending_queue
             .push_reset(ResetMarker { stream_identifier });
+        // KPS PATCH (reset-reuse-guard)
+        *self.outgoing_resets_pending.entry(stream_identifier).or_default() += 1;
         self.awake_write_loop();
 
         Ok(())
