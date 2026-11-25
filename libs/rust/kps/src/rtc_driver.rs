@@ -57,7 +57,9 @@
 //!    handed to SCTP, and discards writes to a stream it is resetting, so an
 //!    early close cut off the stream's tail and its FIN ("closed
 //!    mid-stream"). `close` therefore only marks the channel; the driver
-//!    closes it when its queue and `outstanding_bytes` are both empty.
+//!    closes it when its queue and `outstanding_bytes` are both empty, or,
+//!    as a logged backstop against that count drifting, when it hasn't
+//!    changed for 30 s.
 //!
 //! Handlers normally run on the driver task, one at a time, in event order.
 //! The exception is a handler registered after its event already happened
@@ -410,6 +412,9 @@ struct Channel {
     above: bool,
     /// A close was requested while data was still unacknowledged (rule 8).
     close_when_drained: bool,
+    /// For the rule 8 backstop: the outstanding count last seen while waiting
+    /// to close, and since when it hasn't changed.
+    drain_watch: Option<(usize, Instant)>,
 }
 
 struct Driver {
@@ -433,6 +438,12 @@ struct Driver {
 /// Datagrams drained per wakeup before the driver runs a pass, so one busy
 /// connection can't starve its own timers and writes.
 const READ_BATCH: usize = 64;
+
+/// Rule 8 backstop: how long a deferred close waits on an outstanding count
+/// that isn't changing before closing anyway. Beyond SCTP's retransmission
+/// backoff for several consecutive losses, and equal to the ICE timeouts after
+/// which a silent peer is gone anyway.
+const DRAIN_STALL: Duration = Duration::from_secs(30);
 
 /// Commands handled per batch, for the same reason: a caller that queues
 /// sends as fast as the driver handles them must not keep it from reading
@@ -599,8 +610,33 @@ impl Driver {
             if ch.close_when_drained && buffered == 0 {
                 // Rule 8: the close that was waiting for this.
                 ch.close_when_drained = false;
+                ch.drain_watch = None;
                 if let Some(mut dc) = self.pc.data_channel(*id) {
                     let _ = dc.close();
+                }
+            } else if ch.close_when_drained {
+                // Backstop: under loss rtc's outstanding_bytes can drift (an
+                // acknowledgement whose release is never counted), so a count
+                // that hasn't moved for DRAIN_STALL with nothing queued is
+                // treated as drained. Retransmissions keep it moving long
+                // before then while data really is in flight.
+                let queued = ch.inner.queued.load(Ordering::SeqCst);
+                let now = Instant::now();
+                match ch.drain_watch {
+                    Some((last, since)) if last == out && queued == 0 => {
+                        if now.duration_since(since) >= DRAIN_STALL {
+                            eprintln!(
+                                "[kps-rtc] warning: channel {id} still had {out} bytes outstanding after {}s without change; closing anyway",
+                                DRAIN_STALL.as_secs()
+                            );
+                            ch.close_when_drained = false;
+                            ch.drain_watch = None;
+                            if let Some(mut dc) = self.pc.data_channel(*id) {
+                                let _ = dc.close();
+                            }
+                        }
+                    }
+                    _ => ch.drain_watch = Some((out, now)),
                 }
             }
             if buffered > threshold {
@@ -673,7 +709,7 @@ impl Driver {
         } else {
             // The peer opened it (DCEP): surface it.
             let inner = Arc::new(DcInner::new(RTCDataChannelState::Open));
-            self.channels.insert(id, Channel { inner: inner.clone(), above: false, close_when_drained: false });
+            self.channels.insert(id, Channel { inner: inner.clone(), above: false, close_when_drained: false, drain_watch: None });
             let Some(cmd) = self.cmd_tx.upgrade() else { return };
             let dc = Arc::new(RTCDataChannel { id, inner, cmd });
             let fut = self.shared.on_data_channel.lock().unwrap().as_mut().map(|f| f(dc));
@@ -771,7 +807,7 @@ impl Driver {
                             eprintln!("[kps-rtc] {} created channel {id} ({label})", self.io.local);
                         }
                         let inner = Arc::new(DcInner::new(RTCDataChannelState::Connecting));
-                        self.channels.insert(id, Channel { inner: inner.clone(), above: false, close_when_drained: false });
+                        self.channels.insert(id, Channel { inner: inner.clone(), above: false, close_when_drained: false, drain_watch: None });
                         match self.cmd_tx.upgrade() {
                             Some(cmd) => Ok(Arc::new(RTCDataChannel { id, inner, cmd })),
                             None => Err(DriverError("peer connection closed".into())),
