@@ -47,7 +47,7 @@
 //!    congestion. The inbox sizes and socket buffers are set where the
 //!    sockets are made (`listener.rs`, `rtc_transport.rs`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -121,6 +121,8 @@ enum Cmd {
     },
     Send(RTCDataChannelId, BytesMut),
     CloseChannel(RTCDataChannelId),
+    /// Deliver messages held for a channel whose `on_message` was just set.
+    Replay(RTCDataChannelId),
     SetLowThreshold(RTCDataChannelId, usize),
     With(WithFn),
     Close,
@@ -137,6 +139,11 @@ struct DcInner {
     low_threshold: AtomicUsize,
     on_open: Mutex<Option<OnOpenFn>>,
     on_message: Mutex<Option<OnMessageFn>>,
+    /// Messages that arrived before `on_message` was set, in order. A caller
+    /// can only set it after `create_data_channel` returns, and the peer may
+    /// already have written by then. Flow-control credit bounds how much the
+    /// peer can send before then.
+    held: Mutex<VecDeque<DataChannelMessage>>,
     on_close: Mutex<Option<OnEventFn>>,
     on_low: Mutex<Option<OnEventFn>>,
 }
@@ -150,6 +157,7 @@ impl DcInner {
             low_threshold: AtomicUsize::new(0),
             on_open: Mutex::new(None),
             on_message: Mutex::new(None),
+            held: Mutex::new(VecDeque::new()),
             on_close: Mutex::new(None),
             on_low: Mutex::new(None),
         }
@@ -224,18 +232,23 @@ impl RTCDataChannel {
         }
     }
 
+    /// Sets the message handler. Messages that arrived before it was set are
+    /// replayed to it first, in order, on the driver task.
     pub(crate) fn on_message(&self, f: OnMessageFn) {
         *self.inner.on_message.lock().unwrap() = Some(f);
+        let _ = self.cmd.send(Cmd::Replay(self.id));
     }
 
-    pub(crate) fn on_close(&self, mut f: OnEventFn) {
-        // Closed before the handler was registered (the driver closes a
-        // channel on its own task): run it now, as the close already happened.
-        if self.ready_state() == RTCDataChannelState::Closed {
-            tokio::spawn(f());
-            return;
-        }
+    /// Runs `f` once the channel closes, or now if it already has. Same
+    /// store-then-check, take-once pattern as [`Self::on_open`] (the driver
+    /// sets Closed, then takes the handler, in `channel_closed`).
+    pub(crate) fn on_close(&self, f: OnEventFn) {
         *self.inner.on_close.lock().unwrap() = Some(f);
+        if self.ready_state() == RTCDataChannelState::Closed {
+            if let Some(mut f) = self.inner.on_close.lock().unwrap().take() {
+                tokio::spawn(f());
+            }
+        }
     }
 
     pub(crate) async fn close(&self) -> Result<(), DriverError> {
@@ -379,6 +392,11 @@ struct Driver {
 /// connection can't starve its own timers and writes.
 const READ_BATCH: usize = 64;
 
+/// Commands handled per batch, for the same reason: a caller that queues
+/// sends as fast as the driver handles them must not keep it from reading
+/// the socket (ACKs) or running its timers (retransmissions).
+const CMD_BATCH: usize = 64;
+
 impl Driver {
     async fn run(mut self) {
         let sock_local = self.io.socket.local_addr().ok();
@@ -392,22 +410,9 @@ impl Driver {
             let next = self.pc.poll_timeout().unwrap_or(now + Duration::from_secs(1));
             let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(next.max(now)));
             tokio::select! {
+                // Packets before commands: inbound traffic is bounded by the
+                // network, commands only by the callers (see CMD_BATCH).
                 biased;
-                cmd = self.cmd_rx.recv() => match cmd {
-                    Some(c) => {
-                        self.command(c).await;
-                        while let Ok(c) = self.cmd_rx.try_recv() {
-                            self.command(c).await;
-                        }
-                    }
-                    None => {
-                        // Every handle is gone: nobody can use this connection.
-                        let _ = self.pc.close();
-                        self.pass(sock_local).await;
-                        self.finish().await;
-                        break;
-                    }
-                },
                 pkt = self.io.inbox.recv() => match pkt {
                     Some(p) => {
                         // Rule 1: dispatch after every datagram.
@@ -424,6 +429,22 @@ impl Driver {
                     }
                     None => {
                         // The listener or dial socket went away.
+                        let _ = self.pc.close();
+                        self.pass(sock_local).await;
+                        self.finish().await;
+                        break;
+                    }
+                },
+                cmd = self.cmd_rx.recv() => match cmd {
+                    Some(c) => {
+                        self.command(c).await;
+                        for _ in 1..CMD_BATCH {
+                            let Ok(c) = self.cmd_rx.try_recv() else { break };
+                            self.command(c).await;
+                        }
+                    }
+                    None => {
+                        // Every handle is gone: nobody can use this connection.
                         let _ = self.pc.close();
                         self.pass(sock_local).await;
                         self.finish().await;
@@ -499,7 +520,8 @@ impl Driver {
             }
             // Handlers queue sends as commands; run them before publishing the
             // buffered amounts so the next writer decision sees them.
-            while let Ok(c) = self.cmd_rx.try_recv() {
+            for _ in 0..CMD_BATCH {
+                let Ok(c) = self.cmd_rx.try_recv() else { break };
                 worked = true;
                 self.command(c).await;
             }
@@ -554,7 +576,11 @@ impl Driver {
             }
             RTCPeerConnectionEvent::OnDataChannel(dce) => {
                 if kps_debug() {
-                    eprintln!("[kps-rtc] {} dc event {dce:?}", self.io.local);
+                    let sid = match &dce {
+                        RTCDataChannelEvent::OnOpen(id) => self.pc.data_channel(*id).and_then(|d| d.stream_id()),
+                        _ => None,
+                    };
+                    eprintln!("[kps-rtc] {} dc event {dce:?} stream_id={sid:?}", self.io.local);
                 }
                 self.channel_event(dce).await;
             }
@@ -608,14 +634,16 @@ impl Driver {
             ch.inner.set_state(RTCDataChannelState::Closed);
             ch.inner.queued.store(0, Ordering::SeqCst);
             ch.inner.outstanding.store(0, Ordering::SeqCst);
-            let f = ch.inner.on_close.lock().unwrap().as_mut().map(|f| f());
-            if let Some(f) = f {
-                f.await;
+            // State first (above), then take the handler: on_close relies on
+            // this order.
+            let f = ch.inner.on_close.lock().unwrap().take();
+            if let Some(mut f) = f {
+                f().await;
             }
             // Drop the handlers: they hold the stream/conn state (no cycles
             // outlive the channel).
             ch.inner.on_message.lock().unwrap().take();
-            ch.inner.on_close.lock().unwrap().take();
+            ch.inner.held.lock().unwrap().clear();
             ch.inner.on_low.lock().unwrap().take();
             ch.inner.on_open.lock().unwrap().take();
         }
@@ -630,9 +658,33 @@ impl Driver {
             }
             return;
         };
-        let fut = ch.inner.on_message.lock().unwrap().as_mut().map(|f| f(m));
+        // No handler yet, or messages already held ahead of this one: hold
+        // it, so a Replay delivers everything in arrival order.
+        let fut = {
+            let mut handler = ch.inner.on_message.lock().unwrap();
+            let mut held = ch.inner.held.lock().unwrap();
+            match handler.as_mut() {
+                Some(f) if held.is_empty() => Some(f(m)),
+                _ => {
+                    held.push_back(m);
+                    None
+                }
+            }
+        };
         if let Some(fut) = fut {
             fut.await;
+        }
+    }
+
+    async fn replay(&mut self, id: RTCDataChannelId) {
+        let Some(inner) = self.channels.get(&id).map(|ch| ch.inner.clone()) else { return };
+        loop {
+            let Some(m) = inner.held.lock().unwrap().pop_front() else { return };
+            let fut = inner.on_message.lock().unwrap().as_mut().map(|f| f(m));
+            match fut {
+                Some(fut) => fut.await,
+                None => return,
+            }
         }
     }
 
@@ -691,6 +743,7 @@ impl Driver {
                     ch.inner.queued.fetch_sub(n, Ordering::SeqCst);
                 }
             }
+            Cmd::Replay(id) => self.replay(id).await,
             Cmd::CloseChannel(id) => {
                 if let Some(mut dc) = self.pc.data_channel(id) {
                     let _ = dc.close();

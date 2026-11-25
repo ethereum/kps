@@ -269,3 +269,114 @@ async fn webrtc_concurrent_bulk_streams_byte_exact() {
         t.await.unwrap();
     }
 }
+
+/// The peer writes first on a stream we opened. The first frame can arrive
+/// right after the channel opens, before our side has finished setting the
+/// stream up, and must still be delivered (and the FIN behind it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webrtc_peer_writes_first_on_locally_opened_streams() {
+    let listener = kps::listen(
+        "127.0.0.1:0",
+        ListenOptions { identity: Some(Identity::generate().unwrap()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let addr = listener.address("127.0.0.1");
+    let listener = Arc::new(listener);
+    let l = listener.clone();
+    tokio::spawn(async move {
+        let conn = l.accept().await.unwrap();
+        // Greet on every stream the moment it's accepted, without reading.
+        while let Ok(mut s) = conn.accept_stream().await {
+            tokio::spawn(async move {
+                let _ = s.write_all(b"hello").await;
+                let _ = s.close_write().await;
+            });
+        }
+    });
+    let conn = timeout(T, kps::dial_webrtc(&addr)).await.unwrap().unwrap();
+    for i in 0..300 {
+        let mut s = timeout(T, conn.open_stream()).await.unwrap().unwrap();
+        // The client sends nothing first: the open alone makes the server
+        // accept. (A KPS stream surfaces to the acceptor once the channel
+        // opens.)
+        let mut got = Vec::new();
+        timeout(T, s.read_to_end(&mut got))
+            .await
+            .unwrap_or_else(|_| panic!("stream {i}: read stalled after {got:?}"))
+            .unwrap();
+        assert_eq!(got, b"hello", "stream {i}");
+        s.close_write().await.unwrap();
+    }
+}
+
+/// A sender that keeps the datagram channel saturated must not stall the
+/// connection's other traffic: a stream echo alongside it still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webrtc_datagram_flood_does_not_starve_streams() {
+    let (_l, addr) = start_echo_server().await;
+    let conn: Arc<dyn Conn> = Arc::from(timeout(T, kps::dial_webrtc(&addr)).await.unwrap().unwrap());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood = {
+        let (conn, stop) = (conn.clone(), stop.clone());
+        tokio::spawn(async move {
+            let p = vec![7u8; 1000];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if conn.send_datagram(&p).await.is_err() {
+                    break;
+                }
+                // A dropped datagram completes without waiting; yield so this
+                // loop can't monopolise a worker thread.
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let payload: Vec<u8> = (0..(1 << 20)).map(|j| (j % 251) as u8).collect();
+    let echoed = timeout(T, echo_round_trip(conn.as_ref(), &payload)).await.expect("stream echo stalled under a datagram flood");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flood.await.unwrap();
+    assert!(echoed == payload);
+}
+
+/// Closing a stale handle must not touch a newer stream. The rtc core
+/// reuses SCTP stream ids as channels close, so a late close of an old
+/// stream (retirement closes the channel from a spawned task, up to 250 ms
+/// later) could in principle land on a new stream that reused the id. The
+/// driver addresses channels by a connection-local handle that is never
+/// reused, so the stale close must be a no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webrtc_stale_close_leaves_newer_streams_alone() {
+    let (_l, addr) = start_echo_server().await;
+    let conn = timeout(T, kps::dial_webrtc(&addr)).await.unwrap().unwrap();
+    for round in 0..5 {
+        // A: a complete echo, then wait for its channel to be fully closed
+        // (both resets done, so its SCTP stream id is free for reuse).
+        let mut a = timeout(T, conn.open_stream()).await.unwrap().unwrap();
+        a.write_all(b"old").await.unwrap();
+        a.close_write().await.unwrap();
+        let mut got = Vec::new();
+        timeout(T, a.read_to_end(&mut got)).await.unwrap().unwrap();
+        // Retirement closes A's channel after up to 250 ms, then both resets
+        // must complete before its stream id is free.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // B, on A's freed stream id (rtc hands out the lowest free one);
+        // write, but don't finish yet.
+        let mut b = timeout(T, conn.open_stream()).await.unwrap().unwrap();
+        b.write_all(b"new").await.unwrap();
+        // The stale close: must not reset or close B.
+        let _ = a.close().await;
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        b.close_write().await.unwrap();
+        let mut got = Vec::new();
+        timeout(T, b.read_to_end(&mut got))
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: B stalled"))
+            .unwrap_or_else(|e| panic!("round {round}: B failed: {e}"));
+        assert_eq!(got, b"new", "round {round}");
+        // Let B's channel close too, so the next round's A and B both land on
+        // the same freed id again.
+        drop(b);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+}
