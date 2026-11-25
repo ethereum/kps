@@ -1791,3 +1791,228 @@ mod duplicate_report_test;
 
 #[path = "stream_scheduler_test.rs"]
 mod stream_scheduler_test;
+
+// KPS PATCH (reset-dedupe) tests.
+
+fn reset_request(rsn: u32, stream: u16, sender_last_tsn: u32) -> Box<dyn Param> {
+    Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: rsn,
+        reconfig_response_sequence_number: 0,
+        sender_last_tsn,
+        stream_identifiers: vec![stream],
+    })
+}
+
+fn has_performed_response(reply: &[Packet], rsn: u32) -> bool {
+    reply.iter().flat_map(|p| p.chunks.iter()).any(|c| {
+        c.as_any()
+            .downcast_ref::<ChunkReconfig>()
+            .and_then(|r| r.param_a.as_ref())
+            .and_then(|p| p.as_any().downcast_ref::<ParamReconfigResponse>())
+            .is_some_and(|r| {
+                r.reconfig_response_sequence_number == rsn
+                    && r.result == ReconfigResult::SuccessPerformed
+            })
+    })
+}
+
+/// A retransmitted reset request (our response was lost) must be answered
+/// again without resetting anything: by then the stream id may belong to a
+/// new stream the peer never closed.
+#[test]
+fn test_duplicate_reset_request_is_answered_not_performed_again() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let tsn = a.peer_last_tsn;
+    assert!(a.create_stream(2, true, ppi).is_some());
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(7, 2, tsn), &mut reply)?;
+    assert!(!a.streams.contains_key(&2), "first request resets stream 2");
+    assert!(has_performed_response(&reply, 7));
+
+    // A new stream reuses id 2; then the old request arrives again.
+    assert!(a.create_stream(2, true, ppi).is_some());
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(7, 2, tsn), &mut reply)?;
+    assert!(a.streams.contains_key(&2), "the retransmission must not reset the new stream 2");
+    assert!(has_performed_response(&reply, 7), "but it is answered again");
+    Ok(())
+}
+
+/// Requests can be performed out of order (one deferred for unread data, or
+/// several outstanding at once). A first arrival of an earlier request must
+/// still be performed: the record is a set, not a high-water mark.
+#[test]
+fn test_reset_requests_performed_out_of_order() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let tsn = a.peer_last_tsn;
+    assert!(a.create_stream(2, true, ppi).is_some());
+    assert!(a.create_stream(4, true, ppi).is_some());
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(9, 4, tsn), &mut reply)?;
+    a.handle_reconfig_param(&reset_request(8, 2, tsn), &mut reply)?;
+    assert!(!a.streams.contains_key(&4));
+    assert!(!a.streams.contains_key(&2), "request 8, first seen after 9, is performed");
+    Ok(())
+}
+
+/// The record must outlast heavy churn: many other resets can be performed
+/// before a lost response's request is retransmitted (about an RTO later).
+#[test]
+fn test_duplicate_reset_request_detected_after_many_other_resets() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let tsn = a.peer_last_tsn;
+    let mut reply = vec![];
+    assert!(a.create_stream(2, true, ppi).is_some());
+    a.handle_reconfig_param(&reset_request(1, 2, tsn), &mut reply)?;
+    for rsn in 2..5_000u32 {
+        assert!(a.create_stream(4, true, ppi).is_some());
+        a.handle_reconfig_param(&reset_request(rsn, 4, tsn), &mut reply)?;
+    }
+    assert!(a.create_stream(2, true, ppi).is_some());
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(1, 2, tsn), &mut reply)?;
+    assert!(a.streams.contains_key(&2), "request 1 is still recognised as performed");
+    assert!(has_performed_response(&reply, 1));
+    Ok(())
+}
+
+// KPS PATCH (reset-reuse-guard) tests.
+
+fn reconfig_response(rsn: u32, result: ReconfigResult) -> Box<dyn Param> {
+    Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: rsn,
+        result,
+    })
+}
+
+/// A stream we reset stays blocked for reuse until the peer has performed
+/// the reset: through an In Progress answer, until the final one.
+#[test]
+fn test_pending_outgoing_reset_lasts_until_performed() -> Result<()> {
+    let mut a = timed_test_association();
+    let now = Instant::now();
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let mut stream = a.open_stream(2, ppi)?;
+    stream.close(now)?;
+    assert!(a.has_pending_outgoing_reset(2), "blocked as soon as the reset is queued");
+    a.gather_outbound(now);
+    let rsn = *a.reconfigs.keys().next().expect("the reset request was sent");
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reconfig_response(rsn, ReconfigResult::InProgress), &mut reply)?;
+    assert!(a.has_pending_outgoing_reset(2), "In Progress is not done");
+    a.handle_reconfig_param(&reconfig_response(rsn, ReconfigResult::SuccessPerformed), &mut reply)?;
+    assert!(!a.has_pending_outgoing_reset(2), "the final answer releases it");
+    assert_eq!(a.pending_outgoing_resets().count(), 0);
+    Ok(())
+}
+
+/// The reset we send in answer to the peer's is ours too: its id is blocked
+/// until the peer performs it.
+#[test]
+fn test_answering_reset_blocks_reuse() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let tsn = a.peer_last_tsn;
+    assert!(a.create_stream(4, true, ppi).is_some());
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(50, 4, tsn), &mut reply)?;
+    assert!(!a.streams.contains_key(&4), "the peer's reset is performed");
+    assert!(a.has_pending_outgoing_reset(4), "our answering reset is pending");
+    Ok(())
+}
+
+// KPS PATCH (late-reset-answer) tests.
+
+fn has_reset_request_for(reply: &[Packet], stream: u16) -> bool {
+    reply.iter().flat_map(|p| p.chunks.iter()).any(|c| {
+        c.as_any()
+            .downcast_ref::<ChunkReconfig>()
+            .and_then(|r| r.param_a.as_ref())
+            .and_then(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+            .is_some_and(|r| r.stream_identifiers.contains(&stream))
+    })
+}
+
+/// A reset request that arrives ahead of the peer's last DATA is performed
+/// when that DATA arrives. It must be answered with our own reset then, as
+/// when it is performed on arrival: otherwise the peer's half of the stream
+/// is never unregistered, and the peer's next open on that id fails because
+/// the stream still exists.
+#[test]
+fn test_reset_performed_after_late_data_is_answered() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let last = a.peer_last_tsn.wrapping_add(1);
+    assert!(a.create_stream(4, true, ppi).is_some());
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(60, 4, last), &mut reply)?;
+    assert!(a.streams.contains_key(&4), "deferred: DATA up to {last} not yet received");
+    assert!(!has_reset_request_for(&reply, 4));
+
+    let data = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: last,
+        stream_identifier: 6,
+        user_data: Bytes::from_static(b"late"),
+        ..Default::default()
+    };
+    let reply = a.handle_data(&data)?;
+    assert!(!a.streams.contains_key(&4), "performed once the DATA arrives");
+    assert!(has_performed_response(&reply, 60));
+    assert!(has_reset_request_for(&reply, 4), "and answered with our own reset");
+    assert!(a.has_pending_outgoing_reset(4));
+    Ok(())
+}
+
+// KPS PATCH (reset-partial) tests.
+
+/// A request naming several streams, one still holding unread data, resets
+/// the others at once and defers the rest. Neither a retransmission of the
+/// request nor the retry when the last stream drains may reset an id that
+/// was reused in between.
+#[test]
+fn test_partly_performed_reset_spares_reused_ids() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    assert!(a.create_stream(5, true, ppi).is_some());
+    assert!(a.create_stream(7, true, ppi).is_some());
+    let unread = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn.wrapping_add(1),
+        stream_identifier: 7,
+        user_data: Bytes::from_static(b"unread"),
+        ..Default::default()
+    };
+    a.handle_data(&unread)?;
+    let both = || -> Box<dyn Param> {
+        Box::new(ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: 70,
+            reconfig_response_sequence_number: 0,
+            sender_last_tsn: unread.tsn,
+            stream_identifiers: vec![5, 7],
+        })
+    };
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&both(), &mut reply)?;
+    assert!(!a.streams.contains_key(&5), "5 is reset at once");
+    assert!(a.streams.contains_key(&7), "7 waits for its data to be read");
+
+    assert!(a.create_stream(5, true, ppi).is_some(), "5 is reused");
+    a.handle_reconfig_param(&both(), &mut reply)?;
+    assert!(a.streams.contains_key(&5), "a retransmission spares the new 5");
+
+    assert!(a.stream(7)?.read_sctp()?.is_some());
+    assert!(!a.streams.contains_key(&7), "7 is reset once drained");
+    assert!(a.streams.contains_key(&5), "and the retry spares the new 5");
+    Ok(())
+}
