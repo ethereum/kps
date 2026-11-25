@@ -3924,3 +3924,104 @@ fn test_abort_closes_both_sides() -> Result<()> {
     pair.client_conn_mut(client_ch).abort()?;
     Ok(())
 }
+
+// KPS PATCH (reset-reuse-guard) counter tests. A missed decrement would block
+// a stream id for the life of the association, and nothing else would notice,
+// so each case ends with both sides' pending sets empty.
+
+fn assert_no_pending_resets(pair: &mut Pair, client_ch: AssociationHandle, server_ch: AssociationHandle) {
+    let client: Vec<_> = pair.client_conn_mut(client_ch).pending_outgoing_resets().collect();
+    let server: Vec<_> = pair.server_conn_mut(server_ch).pending_outgoing_resets().collect();
+    assert!(client.is_empty(), "client still blocks {client:?}");
+    assert!(server.is_empty(), "server still blocks {server:?}");
+}
+
+/// Read everything the server holds on `si`, then once more so the drained
+/// stream retries any deferred reset.
+fn server_drains(pair: &mut Pair, server_ch: AssociationHandle, si: u16) -> Result<()> {
+    while let Ok(Some(_)) = pair.server_stream(server_ch, si).and_then(|mut s| s.read_sctp()) {}
+    Ok(())
+}
+
+#[test]
+fn kps_reset_guard_plain_close_releases_both_sides() -> Result<()> {
+    let si: u16 = 1;
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.close(now)?;
+    assert!(pair.client_conn_mut(client_ch).has_pending_outgoing_reset(si));
+    pair.drive();
+
+    assert!(pair.client_conn_mut(client_ch).stream(si).is_err());
+    assert!(pair.server_conn_mut(server_ch).stream(si).is_err());
+    assert_no_pending_resets(&mut pair, client_ch, server_ch);
+    Ok(())
+}
+
+#[test]
+fn kps_reset_guard_simultaneous_close_releases_both_sides() -> Result<()> {
+    let si: u16 = 1;
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?.close(now)?;
+    pair.server_stream(server_ch, si)?.close(now)?;
+    pair.drive();
+
+    assert!(pair.client_conn_mut(client_ch).stream(si).is_err());
+    assert!(pair.server_conn_mut(server_ch).stream(si).is_err());
+    assert_no_pending_resets(&mut pair, client_ch, server_ch);
+    Ok(())
+}
+
+/// The server holds unread data, so it answers In Progress; the id stays
+/// blocked until the final answer. With `lose_final_answer`, the packets the
+/// server sends when it drains (the final answer and its own reset) are
+/// dropped: the client's retransmission must still get the final answer.
+fn in_progress_then_final(lose_final_answer: bool) -> Result<()> {
+    let si: u16 = 1;
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    let now = pair.time;
+    pair.client_stream(client_ch, si)?
+        .write_sctp(now, &Bytes::from_static(b"unread"), PayloadProtocolIdentifier::Binary)?;
+    pair.client_stream(client_ch, si)?.close(now)?;
+    pair.drive_client();
+    deliver_to_server_rtc_style_no_read(&mut pair, server_ch);
+    pair.drive_server();
+    pair.drive_client();
+    assert!(
+        pair.server_conn_mut(server_ch).stream(si).is_ok(),
+        "precondition: the server deferred the reset"
+    );
+    assert!(
+        pair.client_conn_mut(client_ch).has_pending_outgoing_reset(si),
+        "In Progress is not done"
+    );
+
+    server_drains(&mut pair, server_ch, si)?;
+    assert!(pair.server_conn_mut(server_ch).stream(si).is_err(), "performed once drained");
+    if lose_final_answer {
+        pair.drive_server();
+        pair.client.inbound.clear();
+    }
+    pair.drive();
+
+    assert!(pair.client_conn_mut(client_ch).stream(si).is_err());
+    assert_no_pending_resets(&mut pair, client_ch, server_ch);
+    Ok(())
+}
+
+#[test]
+fn kps_reset_guard_in_progress_then_final_answer_releases() -> Result<()> {
+    in_progress_then_final(false)
+}
+
+#[test]
+fn kps_reset_guard_lost_final_answer_is_recovered_by_retransmission() -> Result<()> {
+    in_progress_then_final(true)
+}

@@ -176,6 +176,10 @@ pub struct Association {
     will_send_forward_tsn: bool,
     will_retransmit_fast: bool,
     will_retransmit_reconfig: bool,
+    // KPS PATCH (reset-answer-timer): an answering reset was queued from the
+    // receive path, which has no clock; start the reconfig timer for it on
+    // the next send pass.
+    reconfig_timer_wanted: bool,
     /// True only while the in-flight queue may still hold chunks flagged for
     /// T3-rtx retransmission (set when the timer marks them, cleared once the
     /// scan has re-sent them all). Lets `gather_outbound` skip the O(in-flight)
@@ -197,10 +201,8 @@ pub struct Association {
     performed_reconfig_order: VecDeque<u32>,
     // KPS PATCH (reset-reuse-guard): streams named in our own reset requests
     // that the peer hasn't finished performing (queued, sent and unanswered,
-    // or answered In Progress), counted per stream; and, for requests
-    // answered In Progress, the streams they named, until the final answer.
+    // or answered In Progress), counted per stream.
     outgoing_resets_pending: HashMap<StreamId, usize>,
-    answered_in_progress: HashMap<u32, Vec<StreamId>>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -296,6 +298,7 @@ impl Default for Association {
             will_send_forward_tsn: false,
             will_retransmit_fast: false,
             will_retransmit_reconfig: false,
+            reconfig_timer_wanted: false,
             t3_retransmit_pending: false,
 
             will_send_shutdown_ack: false,
@@ -308,7 +311,6 @@ impl Default for Association {
             performed_reconfig_requests: HashSet::default(),
             performed_reconfig_order: VecDeque::new(),
             outgoing_resets_pending: HashMap::default(),
-            answered_in_progress: HashMap::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -1807,23 +1809,28 @@ impl Association {
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
             // KPS PATCH (reset-reuse-guard): track when the peer has finished
-            // performing our request. In Progress means not yet: it answers
-            // again once done, after we have stopped tracking the request.
+            // performing our request.
             let rsn = p.reconfig_response_sequence_number;
-            let named = self.reconfigs.get(&rsn).and_then(|c| {
+            if p.result == ReconfigResult::InProgress {
+                // KPS PATCH (reset-in-progress): not done yet. Keep the
+                // request and its timer running, so it is retransmitted
+                // until a final answer (RFC 6525 §5.2.7). Stopping here meant
+                // a lost final answer left the ids blocked by the guard for
+                // the life of the association. A retransmission is harmless
+                // at the peer: a pending request is re-evaluated, a performed
+                // one is answered again (reset-dedupe). If the retransmissions
+                // run out (max_reconfig_retrans), nothing is torn down; the
+                // ids just stay blocked.
+                return Ok(());
+            }
+            if let Some(named) = self.reconfigs.get(&rsn).and_then(|c| {
                 c.param_a
                     .as_ref()?
                     .as_any()
                     .downcast_ref::<ParamOutgoingResetRequest>()
                     .map(|r| r.stream_identifiers.clone())
-            });
-            if p.result == ReconfigResult::InProgress {
-                if let Some(named) = named {
-                    self.answered_in_progress.insert(rsn, named);
-                }
-            } else {
-                let named = named.or_else(|| self.answered_in_progress.remove(&rsn));
-                for sid in named.unwrap_or_default() {
+            }) {
+                for sid in named {
                     if let Some(n) = self.outgoing_resets_pending.get_mut(&sid) {
                         *n -= 1;
                         if *n == 0 {
@@ -2278,6 +2285,12 @@ impl Association {
             };
 
             self.reconfigs.insert(rsn, c.clone()); // store in the map for retransmission
+            // KPS PATCH (reset-answer-timer): nothing else starts the timer
+            // for it, so a lost answering reset was never retransmitted
+            // unless we happened to send a reset of our own. The peer's
+            // stream then stayed registered, and its next open on the id
+            // failed.
+            self.reconfig_timer_wanted = true;
 
             let p = self.create_packet(vec![Box::new(c)]);
             reply.push(p);
@@ -2494,6 +2507,12 @@ impl Association {
                 .start_if_idle(Timer::T3RTX, now, self.rto_mgr.get_rto());
 
             self.bundle_data_chunks_into_packets(chunks, &mut raw_packets);
+        }
+
+        // KPS PATCH (reset-answer-timer): see reconfig_timer_wanted.
+        if std::mem::take(&mut self.reconfig_timer_wanted) && !self.reconfigs.is_empty() {
+            self.timers
+                .start_if_idle(Timer::Reconfig, now, self.rto_mgr.get_rto());
         }
 
         if !sis_to_reset.is_empty() || self.will_retransmit_reconfig {
