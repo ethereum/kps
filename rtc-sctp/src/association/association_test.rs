@@ -1926,3 +1926,48 @@ fn test_answering_reset_blocks_reuse() -> Result<()> {
     assert!(a.has_pending_outgoing_reset(4), "our answering reset is pending");
     Ok(())
 }
+
+// KPS PATCH (late-reset-answer) tests.
+
+fn has_reset_request_for(reply: &[Packet], stream: u16) -> bool {
+    reply.iter().flat_map(|p| p.chunks.iter()).any(|c| {
+        c.as_any()
+            .downcast_ref::<ChunkReconfig>()
+            .and_then(|r| r.param_a.as_ref())
+            .and_then(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+            .is_some_and(|r| r.stream_identifiers.contains(&stream))
+    })
+}
+
+/// A reset request that arrives ahead of the peer's last DATA is performed
+/// when that DATA arrives. It must be answered with our own reset then, as
+/// when it is performed on arrival: otherwise the peer's half of the stream
+/// is never unregistered, and the peer's next open on that id fails because
+/// the stream still exists.
+#[test]
+fn test_reset_performed_after_late_data_is_answered() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let last = a.peer_last_tsn.wrapping_add(1);
+    assert!(a.create_stream(4, true, ppi).is_some());
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&reset_request(60, 4, last), &mut reply)?;
+    assert!(a.streams.contains_key(&4), "deferred: DATA up to {last} not yet received");
+    assert!(!has_reset_request_for(&reply, 4));
+
+    let data = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: last,
+        stream_identifier: 6,
+        user_data: Bytes::from_static(b"late"),
+        ..Default::default()
+    };
+    let reply = a.handle_data(&data)?;
+    assert!(!a.streams.contains_key(&4), "performed once the DATA arrives");
+    assert!(has_performed_response(&reply, 60));
+    assert!(has_reset_request_for(&reply, 4), "and answered with our own reset");
+    assert!(a.has_pending_outgoing_reset(4));
+    Ok(())
+}

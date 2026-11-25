@@ -1729,7 +1729,13 @@ impl Association {
             let rst_reqs: Vec<ParamOutgoingResetRequest> =
                 self.reconfig_requests.values().cloned().collect();
             for rst_req in rst_reqs {
-                self.reset_streams_if_any(&rst_req, false, &mut reply)?;
+                // KPS PATCH (late-reset-answer): answer with our own reset,
+                // as when a request is performed on arrival. Without it the
+                // peer's half of the stream is never unregistered, and its
+                // next open on the id fails with ErrStreamAlreadyExist, which
+                // loses that channel's DCEP OPEN. A request performed here is
+                // removed, so this answers it once.
+                self.reset_streams_if_any(&rst_req, true, &mut reply)?;
             }
         }
 
