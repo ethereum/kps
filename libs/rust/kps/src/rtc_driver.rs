@@ -445,6 +445,16 @@ const READ_BATCH: usize = 64;
 /// which a silent peer is gone anyway.
 const DRAIN_STALL: Duration = Duration::from_secs(30);
 
+/// How many times the DRAIN_STALL backstop has closed a channel, process-wide.
+/// Each one is a channel whose outstanding_bytes never reached 0: a bug in
+/// the accounting, which tests assert never happens (see `drain_stalls`).
+static DRAIN_STALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// See [`DRAIN_STALLS`].
+pub(crate) fn drain_stalls() -> usize {
+    DRAIN_STALLS.load(Ordering::SeqCst)
+}
+
 /// Commands handled per batch, for the same reason: a caller that queues
 /// sends as fast as the driver handles them must not keep it from reading
 /// the socket (ACKs) or running its timers (retransmissions).
@@ -629,6 +639,7 @@ impl Driver {
                                 "[kps-rtc] warning: channel {id} still had {out} bytes outstanding after {}s without change; closing anyway",
                                 DRAIN_STALL.as_secs()
                             );
+                            DRAIN_STALLS.fetch_add(1, Ordering::SeqCst);
                             ch.close_when_drained = false;
                             ch.drain_watch = None;
                             if let Some(mut dc) = self.pc.data_channel(*id) {

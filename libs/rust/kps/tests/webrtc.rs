@@ -383,10 +383,11 @@ async fn webrtc_stale_close_leaves_newer_streams_alone() {
 }
 
 /// A UDP relay between a dialer and `server`, dropping about one packet in
-/// `one_in` in each direction (a fixed pseudo-random sequence, so runs are
-/// comparable). Returns the address to dial. Loopback never loses packets,
-/// which hides the races that matter at the end of a stream: a lost FIN or
-/// reset, and the retransmissions that then arrive together.
+/// `one_in` in each direction (a fixed pseudo-random drop sequence; packet
+/// interleaving still varies, so no two runs lose exactly the same packets).
+/// Returns the address to dial. Loopback never loses packets, which hides
+/// the races that matter at the end of a stream: a lost FIN or reset, and
+/// the retransmissions that then arrive together.
 async fn lossy_relay(server: SocketAddr, one_in: u64) -> SocketAddr {
     let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -457,4 +458,22 @@ async fn webrtc_streams_end_cleanly_under_loss() {
     for t in tasks {
         t.await.unwrap();
     }
+
+    // Every stream retired, so all its credit came back: holding the full
+    // stream limit open at once only succeeds if none is still waiting on a
+    // channel close. Each open has less time (T) than the driver's 30 s
+    // drain backstop, which would otherwise free a stuck slot quietly.
+    let mut held = Vec::new();
+    for k in 0..100 {
+        let s = timeout(T, conn.open_stream())
+            .await
+            .unwrap_or_else(|_| panic!("open {k} of 100 stalled: a stream never retired"))
+            .unwrap();
+        held.push(s);
+    }
+    drop(held);
+
+    // The backstop closes a channel whose outstanding bytes never drained:
+    // an accounting bug, which the echoes alone wouldn't show.
+    assert_eq!(kps::rtc_drain_stalls(), 0, "the 30 s drain backstop fired");
 }
