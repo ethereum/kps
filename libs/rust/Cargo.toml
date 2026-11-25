@@ -20,10 +20,8 @@ anyhow = "1"
 # README.md). They share one rev because they come from one workspace, and the
 # rev pins builds so they don't float with the branch. Consumers must copy this
 # block: Cargo applies [patch] only from the root workspace.
-# TEMPORARY (draft): pinned to botreevo/kps until ethereum/kps#14 merges into
-# vendor/rtc; then this switches back to ethereum/kps at the merged rev.
 [patch.crates-io]
-rtc = { git = "https://github.com/botreevo/kps.git", rev = "ca4491cea57a9d4589a45265bae5992f44e941ba" }
-rtc-sctp = { git = "https://github.com/botreevo/kps.git", rev = "ca4491cea57a9d4589a45265bae5992f44e941ba" }
-rtc-dtls = { git = "https://github.com/botreevo/kps.git", rev = "ca4491cea57a9d4589a45265bae5992f44e941ba" }
-rtc-datachannel = { git = "https://github.com/botreevo/kps.git", rev = "ca4491cea57a9d4589a45265bae5992f44e941ba" }
+rtc = { git = "https://github.com/ethereum/kps.git", rev = "8c8fe73b9df3be19df282518da1c77e32e340ceb" }
+rtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "8c8fe73b9df3be19df282518da1c77e32e340ceb" }
+rtc-dtls = { git = "https://github.com/ethereum/kps.git", rev = "8c8fe73b9df3be19df282518da1c77e32e340ceb" }
+rtc-datachannel = { git = "https://github.com/ethereum/kps.git", rev = "8c8fe73b9df3be19df282518da1c77e32e340ceb" }

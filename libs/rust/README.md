@@ -101,5 +101,11 @@ plus these commits (grep `KPS PATCH`):
 | `rtc` | one unreadable stream no longer aborts the SCTP read batch, which silently dropped other channels' acknowledged messages and stalled their streams | [rtc#340](https://github.com/webrtc-rs/rtc/issues/340) |
 | `rtc-sctp` | a peer's reset is no longer held open forever by data on a stream we already closed | not filed yet |
 | `rtc-sctp`, `rtc-datachannel` | bounds checks for two unmarshal panics a connected peer could trigger (cherry-picked) | [rtc#333](https://github.com/webrtc-rs/rtc/pull/333) |
+| `rtc-sctp` | a retransmitted reset request (our response was lost) is answered again, not performed again; performing it reset whatever stream had reused the ids | not filed yet |
+| `rtc`, `rtc-sctp` | a stream id isn't reused while our reset of it is unfinished at the peer; otherwise the new channel's open landed on the peer's old stream and was lost | not filed yet |
+| `rtc` | a channel open on an id still mapped to an old channel replaces it; it arrives in the same read that unregisters the old stream, and was fed to the old channel | not filed yet |
+| `rtc-sctp` | a reset performed when late data arrives is answered with our own reset, as one performed on arrival is; otherwise the peer's next open on the id failed | not filed yet |
+| `rtc-sctp` | retries of a partly performed reset request skip the ids already reset; they reset any stream that had reused one | not filed yet |
+| `rtc-sctp` | a reset request is retransmitted until its final answer, including after In Progress and for the reset sent in answer to the peer's; a lost answer blocked the ids for good | not filed yet |
 
 Drop the patches (and this section) once `rtc` releases equivalent fixes.
