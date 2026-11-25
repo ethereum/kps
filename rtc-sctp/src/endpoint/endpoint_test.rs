@@ -207,15 +207,29 @@ struct Pair {
     latency: Duration, // One-way
 }
 
+/// KPS PATCH (test-loopback): `::1`, or `127.0.0.1` where the host has no
+/// IPv6 loopback (some containers), so the association-pair tests run there
+/// too instead of failing to bind.
+fn loopback() -> std::net::IpAddr {
+    static LOOPBACK: std::sync::OnceLock<std::net::IpAddr> = std::sync::OnceLock::new();
+    *LOOPBACK.get_or_init(|| {
+        if UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_ok() {
+            Ipv6Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        }
+    })
+}
+
 impl Pair {
     pub fn new(endpoint_config: EndpointConfig, server_config: ServerConfig) -> Self {
         let endpoint_config = Arc::new(endpoint_config);
         let server_addr = SocketAddr::new(
-            Ipv6Addr::LOCALHOST.into(),
+            loopback(),
             SERVER_PORTS.lock().unwrap().next().unwrap(),
         );
         let client_addr = SocketAddr::new(
-            Ipv6Addr::LOCALHOST.into(),
+            loopback(),
             CLIENT_PORTS.lock().unwrap().next().unwrap(),
         );
 
