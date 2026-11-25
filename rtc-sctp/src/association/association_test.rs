@@ -1971,3 +1971,48 @@ fn test_reset_performed_after_late_data_is_answered() -> Result<()> {
     assert!(a.has_pending_outgoing_reset(4));
     Ok(())
 }
+
+// KPS PATCH (reset-partial) tests.
+
+/// A request naming several streams, one still holding unread data, resets
+/// the others at once and defers the rest. Neither a retransmission of the
+/// request nor the retry when the last stream drains may reset an id that
+/// was reused in between.
+#[test]
+fn test_partly_performed_reset_spares_reused_ids() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let ppi = PayloadProtocolIdentifier::Binary;
+    assert!(a.create_stream(5, true, ppi).is_some());
+    assert!(a.create_stream(7, true, ppi).is_some());
+    let unread = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn.wrapping_add(1),
+        stream_identifier: 7,
+        user_data: Bytes::from_static(b"unread"),
+        ..Default::default()
+    };
+    a.handle_data(&unread)?;
+    let both = || -> Box<dyn Param> {
+        Box::new(ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: 70,
+            reconfig_response_sequence_number: 0,
+            sender_last_tsn: unread.tsn,
+            stream_identifiers: vec![5, 7],
+        })
+    };
+
+    let mut reply = vec![];
+    a.handle_reconfig_param(&both(), &mut reply)?;
+    assert!(!a.streams.contains_key(&5), "5 is reset at once");
+    assert!(a.streams.contains_key(&7), "7 waits for its data to be read");
+
+    assert!(a.create_stream(5, true, ppi).is_some(), "5 is reused");
+    a.handle_reconfig_param(&both(), &mut reply)?;
+    assert!(a.streams.contains_key(&5), "a retransmission spares the new 5");
+
+    assert!(a.stream(7)?.read_sctp()?.is_some());
+    assert!(!a.streams.contains_key(&7), "7 is reset once drained");
+    assert!(a.streams.contains_key(&5), "and the retry spares the new 5");
+    Ok(())
+}

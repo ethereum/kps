@@ -53,17 +53,17 @@ use log::{debug, error, trace, warn};
 use rand::random;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use thiserror::Error;
 
 /// KPS PATCH (reset-dedupe): how many of the peer's performed reset requests
 /// to remember. A retransmission comes after about an RTO, so this must cover
 /// every reset performed in that time even under heavy stream churn: 65,536
 /// costs about 1 MiB at most and makes eviction irrelevant in practice.
 const PERFORMED_RECONFIG_REQUESTS_MAX: usize = 65_536;
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use thiserror::Error;
 
 pub(crate) mod state;
 pub(crate) mod stats;
@@ -1796,9 +1796,14 @@ impl Association {
                 })]));
                 return Ok(());
             }
-            self.reconfig_requests
-                .insert(p.reconfig_request_sequence_number, p.clone());
-            self.reset_streams_if_any(p, true, reply)?;
+            // KPS PATCH (reset-partial): a retransmission of a request that
+            // was partly performed runs with the stored, reduced id list.
+            let p = self
+                .reconfig_requests
+                .entry(p.reconfig_request_sequence_number)
+                .or_insert_with(|| p.clone())
+                .clone();
+            self.reset_streams_if_any(&p, true, reply)?;
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
             // KPS PATCH (reset-reuse-guard): track when the peer has finished
@@ -2232,6 +2237,15 @@ impl Association {
                     "[{}] resetStream(): deferring reset of {:?}, application has not drained",
                     self.side, draining
                 );
+                // KPS PATCH (reset-partial): the other streams were reset just
+                // now. Keep only the deferred ones, so a later retry doesn't
+                // reset an id that has been reused in the meantime.
+                if let Some(stored) = self
+                    .reconfig_requests
+                    .get_mut(&p.reconfig_request_sequence_number)
+                {
+                    stored.stream_identifiers = draining.clone();
+                }
                 result = ReconfigResult::InProgress;
             }
         } else {
