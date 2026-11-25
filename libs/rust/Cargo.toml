@@ -21,7 +21,7 @@ anyhow = "1"
 # rev pins builds so they don't float with the branch. Consumers must copy this
 # block: Cargo applies [patch] only from the root workspace.
 [patch.crates-io]
-rtc = { git = "https://github.com/ethereum/kps.git", rev = "8c8fe73b9df3be19df282518da1c77e32e340ceb" }
-rtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "8c8fe73b9df3be19df282518da1c77e32e340ceb" }
-rtc-dtls = { git = "https://github.com/ethereum/kps.git", rev = "8c8fe73b9df3be19df282518da1c77e32e340ceb" }
-rtc-datachannel = { git = "https://github.com/ethereum/kps.git", rev = "8c8fe73b9df3be19df282518da1c77e32e340ceb" }
+rtc = { git = "https://github.com/ethereum/kps.git", rev = "935135b09a1b0150d34b59d6df30326e5fa59ed2" }
+rtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "935135b09a1b0150d34b59d6df30326e5fa59ed2" }
+rtc-dtls = { git = "https://github.com/ethereum/kps.git", rev = "935135b09a1b0150d34b59d6df30326e5fa59ed2" }
+rtc-datachannel = { git = "https://github.com/ethereum/kps.git", rev = "935135b09a1b0150d34b59d6df30326e5fa59ed2" }

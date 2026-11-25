@@ -1451,7 +1451,7 @@ dependencies = [
 [[package]]
 name = "rtc"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytes",
  "hex",
@@ -1487,7 +1487,7 @@ dependencies = [
 [[package]]
 name = "rtc-crypto"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "aes",
  "ccm",
@@ -1505,7 +1505,7 @@ dependencies = [
 [[package]]
 name = "rtc-datachannel"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytes",
  "log",
@@ -1517,7 +1517,7 @@ dependencies = [
 [[package]]
 name = "rtc-dtls"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytecheck",
  "byteorder",
@@ -1536,7 +1536,7 @@ dependencies = [
 [[package]]
 name = "rtc-ice"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytes",
  "crc",
@@ -1554,7 +1554,7 @@ dependencies = [
 [[package]]
 name = "rtc-interceptor"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "log",
  "rand 0.10.2",
@@ -1567,7 +1567,7 @@ dependencies = [
 [[package]]
 name = "rtc-mdns"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytes",
  "log",
@@ -1579,7 +1579,7 @@ dependencies = [
 [[package]]
 name = "rtc-media"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "byteorder",
  "bytes",
@@ -1592,7 +1592,7 @@ dependencies = [
 [[package]]
 name = "rtc-rtcp"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytes",
  "rtc-shared",
@@ -1601,7 +1601,7 @@ dependencies = [
 [[package]]
 name = "rtc-rtp"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytes",
  "memchr",
@@ -1613,7 +1613,7 @@ dependencies = [
 [[package]]
 name = "rtc-sctp"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytes",
  "crc32c",
@@ -1628,7 +1628,7 @@ dependencies = [
 [[package]]
 name = "rtc-sdp"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "rand 0.10.2",
  "rtc-shared",
@@ -1638,7 +1638,7 @@ dependencies = [
 [[package]]
 name = "rtc-shared"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bitflags 1.3.2",
  "bytes",
@@ -1654,7 +1654,7 @@ dependencies = [
 [[package]]
 name = "rtc-srtp"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "byteorder",
  "bytes",
@@ -1667,7 +1667,7 @@ dependencies = [
 [[package]]
 name = "rtc-stun"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1683,7 +1683,7 @@ dependencies = [
 [[package]]
 name = "rtc-turn"
 version = "0.21.1"
-source = "git+https://github.com/ethereum/kps.git?rev=8c8fe73b9df3be19df282518da1c77e32e340ceb#8c8fe73b9df3be19df282518da1c77e32e340ceb"
+source = "git+https://github.com/ethereum/kps.git?rev=935135b09a1b0150d34b59d6df30326e5fa59ed2#935135b09a1b0150d34b59d6df30326e5fa59ed2"
 dependencies = [
  "bytes",
  "log",
