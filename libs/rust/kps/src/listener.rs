@@ -5,7 +5,7 @@
 //! (which demultiplexes its own connections by connection ID).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -94,7 +94,9 @@ pub(crate) fn enlarge_udp_buffers(socket: &UdpSocket) {
 
 /// Binds a UDP socket and starts accepting kps connections. `addr` is a
 /// `host:port` string (use `":0"` or `"127.0.0.1:0"` for an ephemeral port).
-/// A bare `":port"` binds the dual-stack wildcard, like Go.
+/// A bare `":port"` binds the dual-stack wildcard `[::]` (dual-stack where
+/// the OS defaults `IPV6_V6ONLY` off, as Linux does), falling back to the IPv4
+/// wildcard on a host where `[::]` can't be bound (no IPv6), like Go.
 pub async fn listen(addr: &str, opts: ListenOptions) -> Result<Listener> {
     let identity = match opts.identity {
         Some(id) => id,
@@ -104,7 +106,8 @@ pub async fn listen(addr: &str, opts: ListenOptions) -> Result<Listener> {
         }
     };
 
-    let bind: SocketAddr = if let Some(port) = addr.strip_prefix(':') {
+    let wildcard_port = addr.strip_prefix(':');
+    let bind: SocketAddr = if let Some(port) = wildcard_port {
         format!("[::]:{port}")
             .parse()
             .map_err(|e| Error::Address(format!("bad listen addr {addr:?}: {e}")))?
@@ -113,11 +116,22 @@ pub async fn listen(addr: &str, opts: ListenOptions) -> Result<Listener> {
             .map_err(|e| Error::Address(format!("bad listen addr {addr:?}: {e}")))?
     };
 
-    let socket = Arc::new(
-        UdpSocket::bind(bind)
-            .await
-            .map_err(|e| Error::Transport(format!("listen {addr:?}: {e}")))?,
-    );
+    let socket = match UdpSocket::bind(bind).await {
+        Ok(s) => s,
+        // A host without IPv6 can't bind [::]. A bare ":port" then means the
+        // IPv4 wildcard, as Go's net.ListenUDP does. Not when the port is in
+        // use: a v6-only socket holding [::]:port would let the v4 bind
+        // succeed, silently serving IPv4 only instead of reporting the clash.
+        Err(e) if wildcard_port.is_some() && e.kind() != std::io::ErrorKind::AddrInUse => {
+            UdpSocket::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), bind.port()))
+                .await
+                .map_err(|e4| {
+                    Error::Transport(format!("listen {addr:?}: [::]: {e}; 0.0.0.0: {e4}"))
+                })?
+        }
+        Err(e) => return Err(Error::Transport(format!("listen {addr:?}: {e}"))),
+    };
+    let socket = Arc::new(socket);
     enlarge_udp_buffers(&socket);
     let local = socket.local_addr()?;
 

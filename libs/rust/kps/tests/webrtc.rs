@@ -40,6 +40,18 @@ async fn webrtc_echo_wildcard_listener_on_loopback() {
 }
 
 #[tokio::test]
+async fn webrtc_echo_bare_port_listener() {
+    // ":port" is how tor-js-gateway listens. It means the dual-stack wildcard,
+    // and must still work on a host with no IPv6 at all, where [::] can't be
+    // bound: there it falls back to the IPv4 wildcard, like Go.
+    let (_l, addr) = start_echo_server_on(":0").await;
+    let conn = timeout(T, kps::dial_webrtc(&addr)).await.unwrap().unwrap();
+    let echoed = echo_round_trip(conn.as_ref(), b"bare port").await;
+    assert_eq!(echoed, b"bare port");
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn webrtc_multi_stream() {
     let (_l, addr) = start_echo_server().await;
     let conn: Arc<dyn Conn> =
