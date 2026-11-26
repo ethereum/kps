@@ -94,7 +94,9 @@ pub(crate) fn enlarge_udp_buffers(socket: &UdpSocket) {
 
 /// Binds a UDP socket and starts accepting kps connections. `addr` is a
 /// `host:port` string (use `":0"` or `"127.0.0.1:0"` for an ephemeral port).
-/// A bare `":port"` binds the dual-stack wildcard, like Go.
+/// A bare `":port"` binds the dual-stack wildcard `[::]` (dual-stack where
+/// the OS defaults `IPV6_V6ONLY` off, as Linux does), falling back to the IPv4
+/// wildcard on a host where `[::]` can't be bound (no IPv6), like Go.
 pub async fn listen(addr: &str, opts: ListenOptions) -> Result<Listener> {
     let identity = match opts.identity {
         Some(id) => id,
@@ -117,11 +119,15 @@ pub async fn listen(addr: &str, opts: ListenOptions) -> Result<Listener> {
     let socket = match UdpSocket::bind(bind).await {
         Ok(s) => s,
         // A host without IPv6 can't bind [::]. A bare ":port" then means the
-        // IPv4 wildcard, as Go's net.ListenUDP does.
-        Err(e) if wildcard_port.is_some() => {
+        // IPv4 wildcard, as Go's net.ListenUDP does. Not when the port is in
+        // use: a v6-only socket holding [::]:port would let the v4 bind
+        // succeed, silently serving IPv4 only instead of reporting the clash.
+        Err(e) if wildcard_port.is_some() && e.kind() != std::io::ErrorKind::AddrInUse => {
             UdpSocket::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), bind.port()))
                 .await
-                .map_err(|_| Error::Transport(format!("listen {addr:?}: {e}")))?
+                .map_err(|e4| {
+                    Error::Transport(format!("listen {addr:?}: [::]: {e}; 0.0.0.0: {e4}"))
+                })?
         }
         Err(e) => return Err(Error::Transport(format!("listen {addr:?}: {e}"))),
     };
